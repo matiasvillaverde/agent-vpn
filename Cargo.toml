@@ -28,3 +28,7 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = true
+
+[[bin]]
+name = "vpn"
+path = "src/main.rs"
