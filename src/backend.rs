@@ -1,0 +1,901 @@
+//! Tunnel operations built on top of a [`CommandRunner`].
+//!
+//! Every operation is idempotent and non-interactive so that agents can call
+//! them repeatedly without special-casing "already up"/"already down" states.
+//!
+//! Live state is observed via a single `wg show all dump` per command; tunnels
+//! are matched to interfaces by peer identity (public key + allowed-IPs set),
+//! which works without `wg-quick`'s root-only name file on macOS.
+
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
+
+use crate::config::{self, Tunnel};
+use crate::error::{Error, Result};
+use crate::probe::{self, ProbeResult};
+use crate::runner::{CommandOutput, CommandRunner};
+use crate::status::{self, DumpPeer, ListEntry, TunnelStatus};
+
+/// Orchestrates `wg-quick`/`wg`/`curl` for a set of tunnel configs.
+pub struct Backend<R: CommandRunner> {
+    runner: R,
+    config_dir: PathBuf,
+    sudo: bool,
+    wg: String,
+    wg_quick: String,
+    curl: String,
+}
+
+impl<R: CommandRunner> Backend<R> {
+    /// Create a backend for the tunnels in `config_dir`; `sudo` prefixes the
+    /// privileged (`wg`/`wg-quick`) commands with `sudo -n`.
+    ///
+    /// Programs default to bare names (resolved via `PATH`); override them with
+    /// [`Backend::with_programs`] when `PATH` is unreliable (e.g. under `sudo`,
+    /// which drops Homebrew's `/opt/homebrew/bin`).
+    pub fn new(runner: R, config_dir: PathBuf, sudo: bool) -> Self {
+        Self {
+            runner,
+            config_dir,
+            sudo,
+            wg: "wg".to_string(),
+            wg_quick: "wg-quick".to_string(),
+            curl: "curl".to_string(),
+        }
+    }
+
+    /// Override the `wg`, `wg-quick` and `curl` program paths (absolute paths
+    /// survive `sudo`'s `PATH` scrubbing).
+    #[must_use]
+    pub fn with_programs(mut self, wg: String, wg_quick: String, curl: String) -> Self {
+        self.wg = wg;
+        self.wg_quick = wg_quick;
+        self.curl = curl;
+        self
+    }
+
+    /// The configured tunnel directory.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
+    /// Run a privileged backend program, applying the `sudo -n` prefix when
+    /// configured (`-n` fails fast instead of prompting for a password).
+    fn exec(&self, program: &str, args: &[&str]) -> Result<CommandOutput> {
+        let (program, args) = command_line(self.sudo, program, args);
+        self.runner
+            .run(&program, &args)
+            .map_err(|source| Error::Spawn { program, source })
+    }
+
+    /// Snapshot every live WireGuard peer via one `wg show all dump`.
+    fn all_dump(&self) -> Result<Vec<DumpPeer>> {
+        let out = self.exec(&self.wg, &["show", "all", "dump"])?;
+        if !out.success() {
+            return Err(backend_error(&self.wg, &out));
+        }
+        Ok(status::parse_all_dump(&out.stdout))
+    }
+
+    /// Find the live peer row serving `tunnel`, if any.
+    ///
+    /// Candidates must match the config's peer public key. When the config
+    /// declares allowed-IPs, the live allowed-IPs set must match exactly —
+    /// sibling configs for the same server share a public key and differ only
+    /// in routing, so the routing set is the discriminator.
+    fn find_live<'d>(&self, tunnel: &Tunnel, dump: &'d [DumpPeer]) -> Result<Option<&'d DumpPeer>> {
+        let id = config::peer_identity(&tunnel.path)?;
+        let mut candidates = dump.iter().filter(|d| d.peer.public_key == id.public_key);
+        if id.allowed_ips.is_empty() {
+            return Ok(candidates.next());
+        }
+        Ok(candidates.find(|d| status::normalize_allowed(&d.peer.allowed_ips) == id.allowed_ips))
+    }
+
+    /// Build a [`TunnelStatus`] from a matched dump row (or its absence).
+    fn status_from(&self, name: &str, live: Option<&DumpPeer>, dump: &[DumpPeer]) -> TunnelStatus {
+        match live {
+            None => TunnelStatus::down(name),
+            Some(hit) => TunnelStatus {
+                name: name.to_string(),
+                up: true,
+                interface: Some(hit.interface.clone()),
+                peers: dump
+                    .iter()
+                    .filter(|d| d.interface == hit.interface)
+                    .map(|d| d.peer.clone())
+                    .collect(),
+            },
+        }
+    }
+
+    /// Detailed status for a single tunnel (must exist in the config dir).
+    pub fn status_one(&self, name: &str) -> Result<TunnelStatus> {
+        let tunnel = config::resolve(&self.config_dir, name)?;
+        let dump = self.all_dump()?;
+        let live = self.find_live(&tunnel, &dump)?;
+        Ok(self.status_from(name, live, &dump))
+    }
+
+    /// Detailed status for every discovered tunnel (one `wg` call total).
+    pub fn status_all(&self) -> Result<Vec<TunnelStatus>> {
+        let tunnels = config::discover(&self.config_dir)?;
+        let dump = self.all_dump()?;
+        tunnels
+            .iter()
+            .map(|t| {
+                let live = self.find_live(t, &dump)?;
+                Ok(self.status_from(&t.name, live, &dump))
+            })
+            .collect()
+    }
+
+    /// Names and up/down state of every discovered tunnel (one `wg` call).
+    pub fn list(&self) -> Result<Vec<ListEntry>> {
+        let tunnels = config::discover(&self.config_dir)?;
+        let dump = self.all_dump()?;
+        tunnels
+            .iter()
+            .map(|t| {
+                Ok(ListEntry {
+                    name: t.name.clone(),
+                    up: self.find_live(t, &dump)?.is_some(),
+                })
+            })
+            .collect()
+    }
+
+    /// Names of tunnels that are currently up (one `wg` call).
+    pub fn current(&self) -> Result<Vec<String>> {
+        let tunnels = config::discover(&self.config_dir)?;
+        let dump = self.all_dump()?;
+        let mut active = Vec::new();
+        for t in &tunnels {
+            if self.find_live(t, &dump)?.is_some() {
+                active.push(t.name.clone());
+            }
+        }
+        Ok(active)
+    }
+
+    /// Bring a tunnel up. Returns `(changed, status)` where `changed` is `false`
+    /// if it was already up.
+    pub fn up(&self, name: &str) -> Result<(bool, TunnelStatus)> {
+        let tunnel = config::resolve(&self.config_dir, name)?;
+        let dump = self.all_dump()?;
+        if let Some(live) = self.find_live(&tunnel, &dump)? {
+            return Ok((false, self.status_from(name, Some(live), &dump)));
+        }
+        let path = tunnel.path.to_string_lossy().into_owned();
+        let out = self.exec(&self.wg_quick, &["up", &path])?;
+        if !out.success() {
+            return Err(backend_error(&self.wg_quick, &out));
+        }
+        Ok((true, self.status_one(name)?))
+    }
+
+    /// Bring a tunnel down. Returns `changed`, which is `false` if it was
+    /// already down.
+    pub fn down(&self, name: &str) -> Result<bool> {
+        let tunnel = config::resolve(&self.config_dir, name)?;
+        let dump = self.all_dump()?;
+        if self.find_live(&tunnel, &dump)?.is_none() {
+            return Ok(false);
+        }
+        let path = tunnel.path.to_string_lossy().into_owned();
+        let out = self.exec(&self.wg_quick, &["down", &path])?;
+        if !out.success() {
+            return Err(backend_error(&self.wg_quick, &out));
+        }
+        Ok(true)
+    }
+
+    /// Probe latency through one tunnel, or through every configured tunnel
+    /// when `name` is `None` (sequentially — one request per tunnel).
+    ///
+    /// Results are sorted successes-first by total time. Per-tunnel failures
+    /// (backend refusal, request failure) are embedded in the results rather
+    /// than aborting the sweep; only environment-level errors (missing tunnel,
+    /// unspawnable `wg`) return `Err`.
+    pub fn probe(&self, name: Option<&str>, url: &str, max_time: u64) -> Result<Vec<ProbeResult>> {
+        let tunnels = match name {
+            Some(n) => vec![config::resolve(&self.config_dir, n)?],
+            None => config::discover(&self.config_dir)?,
+        };
+        let mut results = Vec::with_capacity(tunnels.len());
+        for tunnel in &tunnels {
+            results.push(self.probe_one(tunnel, url, max_time)?);
+        }
+        results.sort_by(|a, b| {
+            b.ok.cmp(&a.ok)
+                .then_with(|| {
+                    a.total_ms()
+                        .partial_cmp(&b.total_ms())
+                        .unwrap_or(Ordering::Equal)
+                })
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(results)
+    }
+
+    /// Send exactly one timed request through `tunnel`, restoring its previous
+    /// up/down state afterwards.
+    fn probe_one(&self, tunnel: &Tunnel, url: &str, max_time: u64) -> Result<ProbeResult> {
+        let dump = self.all_dump()?;
+        let was_up = self.find_live(tunnel, &dump)?.is_some();
+        let mut result = ProbeResult::new(&tunnel.name, url, !was_up);
+        let path = tunnel.path.to_string_lossy().into_owned();
+
+        if !was_up {
+            let out = self.exec(&self.wg_quick, &["up", &path])?;
+            if !out.success() {
+                result.error = Some(backend_error(&self.wg_quick, &out).to_string());
+                return Ok(result);
+            }
+        }
+
+        // Interface details for the report (best effort — never fails a probe).
+        if let Ok(dump) = self.all_dump() {
+            if let Ok(Some(live)) = self.find_live(tunnel, &dump) {
+                result.interface = Some(live.interface.clone());
+            }
+        }
+
+        // The request itself runs unprivileged: curl never goes through sudo.
+        let timeout = max_time.to_string();
+        let curl_args: Vec<String> = [
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            probe::CURL_FORMAT,
+            "--max-time",
+            &timeout,
+            url,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        match self.runner.run(&self.curl, &curl_args) {
+            Err(e) => result.error = Some(format!("failed to run '{}': {e}", self.curl)),
+            Ok(out) if !out.success() => {
+                let msg = out.stderr.trim();
+                result.error = Some(if msg.is_empty() {
+                    format!("{} exited {}", self.curl, out.code.unwrap_or(-1))
+                } else {
+                    msg.to_string()
+                });
+            }
+            Ok(out) => match probe::parse_curl_output(out.stdout.trim()) {
+                Ok((timings, remote_ip, http_code)) => {
+                    result.ok = true;
+                    result.timings = Some(timings);
+                    result.remote_ip = remote_ip;
+                    result.http_code = http_code;
+                }
+                Err(msg) => result.error = Some(format!("unexpected curl output: {msg}")),
+            },
+        }
+
+        if !was_up {
+            match self.exec(&self.wg_quick, &["down", &path]) {
+                Ok(out) if out.success() => {}
+                Ok(out) => {
+                    result.warning = Some(format!(
+                        "failed to restore tunnel state: {}",
+                        backend_error(&self.wg_quick, &out)
+                    ));
+                }
+                Err(e) => {
+                    result.warning = Some(format!("failed to restore tunnel state: {e}"));
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+/// Build the `(program, args)` to launch, applying the optional `sudo -n`
+/// prefix (`-n` = never prompt; fail immediately if a password would be
+/// required).
+fn command_line(sudo: bool, program: &str, args: &[&str]) -> (String, Vec<String>) {
+    if sudo {
+        let mut full = Vec::with_capacity(args.len() + 2);
+        full.push("-n".to_string());
+        full.push(program.to_string());
+        full.extend(args.iter().map(|s| (*s).to_string()));
+        ("sudo".to_string(), full)
+    } else {
+        (
+            program.to_string(),
+            args.iter().map(|s| (*s).to_string()).collect(),
+        )
+    }
+}
+
+/// Turn a failed command's output into a [`Error::Backend`].
+fn backend_error(program: &str, out: &CommandOutput) -> Error {
+    let detail = if out.stderr.trim().is_empty() {
+        out.stdout.trim()
+    } else {
+        out.stderr.trim()
+    };
+    Error::Backend {
+        program: program.to_string(),
+        code: out.code.unwrap_or(-1),
+        stderr: detail.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::MockRunner;
+    use std::fs;
+    use tempfile::{tempdir, TempDir};
+
+    /// Conf whose peer identity matches `ALL_DUMP`'s first interface.
+    const CONF: &str = "[Interface]\nPrivateKey = IFPRIV\nAddress = 10.0.0.2/32\n\n\
+        [Peer]\nPublicKey = PEERKEY\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 203.0.113.1:51820\n";
+
+    /// Sibling conf: same server key, split-tunnel allowed-IPs.
+    const CONF_SPLIT: &str = "[Peer]\nPublicKey = PEERKEY\nAllowedIPs = 0.0.0.0/1, 128.0.0.0/1\n";
+
+    /// Conf for a second, distinct server.
+    const CONF_OTHER: &str = "[Peer]\nPublicKey = OTHERKEY\nAllowedIPs = 0.0.0.0/0\n";
+
+    /// `wg show all dump` output with the CONF tunnel live on utun7.
+    const ALL_DUMP: &str = "utun7\tIFPRIV\tIFPUB\t51820\toff\n\
+        utun7\tPEERKEY\t(none)\t203.0.113.1:51820\t0.0.0.0/0,::/0\t1700000000\t1024\t2048\t25\n";
+
+    const CURL_OK: &str = "0.004000,0.012000,0.140000,0.290000,0.291000,104.16.132.229,200";
+    const URL: &str = "https://1.1.1.1/cdn-cgi/trace";
+
+    /// Config dir holding a single `home.conf` matching ALL_DUMP.
+    fn fixture() -> TempDir {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("home.conf"), CONF).unwrap();
+        cfg
+    }
+
+    fn backend(runner: MockRunner, cfg: &TempDir, sudo: bool) -> Backend<MockRunner> {
+        Backend::new(runner, cfg.path().to_path_buf(), sudo)
+    }
+
+    #[test]
+    fn command_line_without_sudo() {
+        let (p, a) = command_line(false, "wg", &["show", "all", "dump"]);
+        assert_eq!(p, "wg");
+        assert_eq!(a, vec!["show", "all", "dump"]);
+    }
+
+    #[test]
+    fn command_line_with_sudo_uses_non_interactive_flag() {
+        let (p, a) = command_line(true, "wg-quick", &["up", "/x.conf"]);
+        assert_eq!(p, "sudo");
+        assert_eq!(a, vec!["-n", "wg-quick", "up", "/x.conf"]);
+    }
+
+    #[test]
+    fn backend_error_prefers_stderr_then_stdout() {
+        let e = backend_error(
+            "wg-quick",
+            &CommandOutput {
+                code: Some(2),
+                stdout: "out".into(),
+                stderr: "  boom  ".into(),
+            },
+        );
+        assert!(matches!(e, Error::Backend { code: 2, ref stderr, .. } if stderr == "boom"));
+
+        let e = backend_error(
+            "wg-quick",
+            &CommandOutput {
+                code: None,
+                stdout: "fallback".into(),
+                stderr: "   ".into(),
+            },
+        );
+        assert!(matches!(e, Error::Backend { code: -1, ref stderr, .. } if stderr == "fallback"));
+    }
+
+    #[test]
+    fn up_when_down_brings_up() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: nothing live
+        runner.ok(""); // wg-quick up
+        runner.ok(ALL_DUMP); // status_one's all_dump
+        let b = backend(runner.clone(), &cfg, false);
+
+        let (changed, status) = b.up("home").unwrap();
+        assert!(changed);
+        assert!(status.up);
+        assert_eq!(status.interface.as_deref(), Some("utun7"));
+        assert_eq!(status.peers.len(), 1);
+        assert_eq!(
+            status.peers[0].endpoint.as_deref(),
+            Some("203.0.113.1:51820")
+        );
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].0, "wg-quick");
+        assert_eq!(calls[1].1[0], "up");
+    }
+
+    #[test]
+    fn up_when_already_up_is_noop() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // all_dump: live
+        let b = backend(runner.clone(), &cfg, false);
+
+        let (changed, status) = b.up("home").unwrap();
+        assert!(!changed);
+        assert!(status.up);
+        // wg-quick must not have been invoked; one wg call suffices.
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(runner.calls()[0].0, "wg");
+    }
+
+    #[test]
+    fn up_backend_failure_is_reported() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down
+        runner.fail(2, "address already in use"); // wg-quick up fails
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.up("home").unwrap_err().exit_code(), 5);
+    }
+
+    #[test]
+    fn up_missing_tunnel() {
+        let cfg = fixture();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(b.up("ghost").unwrap_err().exit_code(), 3);
+    }
+
+    #[test]
+    fn up_spawn_failure() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.spawn_err(); // wg cannot be launched
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.up("home").unwrap_err().exit_code(), 6);
+    }
+
+    #[test]
+    fn wg_failure_is_an_error_not_down() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.fail(1, "permission denied");
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.status_one("home").unwrap_err().exit_code(), 5);
+    }
+
+    #[test]
+    fn down_when_up_brings_down() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // live
+        runner.ok(""); // wg-quick down
+        let b = backend(runner.clone(), &cfg, false);
+
+        assert!(b.down("home").unwrap());
+        let calls = runner.calls();
+        assert_eq!(calls[1].0, "wg-quick");
+        assert_eq!(calls[1].1[0], "down");
+    }
+
+    #[test]
+    fn down_when_already_down_is_noop() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // nothing live
+        let b = backend(runner.clone(), &cfg, false);
+        assert!(!b.down("home").unwrap());
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn down_backend_failure() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP);
+        runner.fail(1, "permission denied");
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.down("home").unwrap_err().exit_code(), 5);
+    }
+
+    #[test]
+    fn down_missing_tunnel() {
+        let cfg = fixture();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(b.down("ghost").unwrap_err().exit_code(), 3);
+    }
+
+    #[test]
+    fn status_one_up_and_down() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP);
+        runner.ok("");
+        let b = backend(runner, &cfg, false);
+
+        let up = b.status_one("home").unwrap();
+        assert!(up.up);
+        assert_eq!(up.interface.as_deref(), Some("utun7"));
+        let down = b.status_one("home").unwrap();
+        assert!(!down.up);
+    }
+
+    #[test]
+    fn sibling_configs_disambiguated_by_allowed_ips() {
+        // Same server public key; only the full-tunnel config is live.
+        let cfg = fixture();
+        fs::write(cfg.path().join("split.conf"), CONF_SPLIT).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // one status_all dump
+        let b = backend(runner, &cfg, false);
+
+        let all = b.status_all().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].up, "full-tunnel 'home' must be detected as up");
+        assert!(!all[1].up, "sibling 'split' must not claim the interface");
+    }
+
+    #[test]
+    fn pubkey_only_match_when_conf_has_no_allowed_ips() {
+        let cfg = tempdir().unwrap();
+        fs::write(
+            cfg.path().join("bare.conf"),
+            "[Peer]\nPublicKey = PEERKEY\n",
+        )
+        .unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP);
+        let b = backend(runner, &cfg, false);
+        assert!(b.status_one("bare").unwrap().up);
+    }
+
+    #[test]
+    fn conf_without_peer_is_an_error() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("bad.conf"), "[Interface]\nPrivateKey = X\n").unwrap();
+        let runner = MockRunner::new();
+        runner.ok("");
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.status_one("bad").unwrap_err().exit_code(), 1);
+    }
+
+    #[test]
+    fn list_and_current_use_one_wg_call() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("other.conf"), CONF_OTHER).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP);
+        let b = backend(runner.clone(), &cfg, false);
+
+        let entries = b.list().unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ListEntry {
+                    name: "home".into(),
+                    up: true
+                },
+                ListEntry {
+                    name: "other".into(),
+                    up: false
+                },
+            ]
+        );
+        assert_eq!(runner.calls().len(), 1, "list must need only one wg call");
+
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP);
+        let b = backend(runner.clone(), &cfg, false);
+        assert_eq!(b.current().unwrap(), vec!["home".to_string()]);
+        assert_eq!(runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn sudo_prefixes_privileged_calls() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump
+        runner.ok(""); // wg-quick up
+        runner.ok(ALL_DUMP); // status all_dump
+        let b = backend(runner.clone(), &cfg, true);
+
+        b.up("home").unwrap();
+        for (program, args) in runner.calls() {
+            assert_eq!(program, "sudo");
+            assert_eq!(args[0], "-n");
+        }
+    }
+
+    #[test]
+    fn probe_activates_probes_and_restores() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down
+        runner.ok(""); // wg-quick up
+        runner.ok(ALL_DUMP); // info dump
+        runner.ok(CURL_OK); // curl
+        runner.ok(""); // wg-quick down (restore)
+        let b = backend(runner.clone(), &cfg, true);
+
+        let results = b.probe(Some("home"), URL, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(r.ok);
+        assert!(r.activated);
+        assert_eq!(r.interface.as_deref(), Some("utun7"));
+        assert_eq!(r.http_code, Some(200));
+        assert_eq!(r.remote_ip.as_deref(), Some("104.16.132.229"));
+        assert_eq!(r.timings.as_ref().unwrap().total_ms, 291.0);
+        assert!(r.error.is_none() && r.warning.is_none());
+
+        // curl must run unprivileged even with sudo configured.
+        let calls = runner.calls();
+        let programs: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(programs, vec!["sudo", "sudo", "sudo", "curl", "sudo"]);
+        // And the restore call is a wg-quick down.
+        let last = &runner.calls()[4];
+        assert_eq!(last.1[1], "wg-quick");
+        assert_eq!(last.1[2], "down");
+    }
+
+    #[test]
+    fn probe_leaves_running_tunnel_up() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info dump
+        runner.ok(CURL_OK); // curl
+        let b = backend(runner.clone(), &cfg, false);
+
+        let results = b.probe(Some("home"), URL, 10).unwrap();
+        assert!(results[0].ok);
+        assert!(!results[0].activated);
+        // No wg-quick calls at all: state untouched.
+        assert!(runner.calls().iter().all(|(p, _)| p != "wg-quick"));
+    }
+
+    #[test]
+    fn probe_reports_up_failure() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.fail(1, "resolvconf missing"); // wg-quick up fails
+        let b = backend(runner.clone(), &cfg, false);
+
+        let results = b.probe(Some("home"), URL, 10).unwrap();
+        let r = &results[0];
+        assert!(!r.ok);
+        assert!(r.error.as_deref().unwrap().contains("resolvconf"));
+        assert_eq!(
+            runner.calls().len(),
+            2,
+            "no curl, no restore after failed up"
+        );
+    }
+
+    #[test]
+    fn probe_curl_failure_still_restores() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(ALL_DUMP); // info
+        runner.fail(7, "curl: (7) Failed to connect"); // curl fails
+        runner.ok(""); // restore down
+        let b = backend(runner.clone(), &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(!r.ok);
+        assert!(r.error.as_deref().unwrap().contains("Failed to connect"));
+        assert!(r.warning.is_none());
+        let last = runner.calls().last().unwrap().clone();
+        assert_eq!(last.0, "wg-quick");
+        assert_eq!(last.1[0], "down");
+    }
+
+    #[test]
+    fn probe_curl_failure_without_stderr_reports_exit() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.fail(28, ""); // curl timeout, silent
+        let b = backend(runner, &cfg, false);
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(r.error.as_deref().unwrap().contains("exited 28"));
+    }
+
+    #[test]
+    fn probe_restore_failure_becomes_warning() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK); // curl ok
+        runner.fail(1, "cannot remove utun"); // restore fails
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(r.ok, "probe data is still valid");
+        assert!(r
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn probe_curl_spawn_failure_is_embedded_and_restores() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(ALL_DUMP); // info
+        runner.spawn_err(); // curl missing
+        runner.ok(""); // restore
+        let b = backend(runner.clone(), &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(!r.ok);
+        assert!(r.error.as_deref().unwrap().contains("failed to run"));
+        assert_eq!(runner.calls().last().unwrap().1[0], "down");
+    }
+
+    #[test]
+    fn probe_tolerates_failing_info_dump() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.fail(1, "transient"); // info dump fails: best-effort, ignored
+        runner.ok(CURL_OK); // curl
+        runner.ok(""); // restore
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(r.ok, "probe succeeds without interface info");
+        assert_eq!(r.interface, None);
+    }
+
+    #[test]
+    fn probe_restore_spawn_failure_becomes_warning() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK); // curl ok
+        runner.spawn_err(); // restore cannot even launch
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(r.ok);
+        assert!(r
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn probe_bad_curl_output_is_an_error() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // up
+        runner.ok(ALL_DUMP); // info
+        runner.ok("<html>captive portal</html>"); // nonsense
+        let b = backend(runner, &cfg, false);
+        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        assert!(!r.ok);
+        assert!(r
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unexpected curl output"));
+    }
+
+    #[test]
+    fn probe_all_sorts_successes_first() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("other.conf"), CONF_OTHER).unwrap();
+        let runner = MockRunner::new();
+        // 'home' (alphabetically first): full success.
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK); // curl
+        runner.ok(""); // restore
+                       // 'other': curl fails.
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(""); // info (not found)
+        runner.fail(7, "curl: (7)"); // curl
+        runner.ok(""); // restore
+        let b = backend(runner, &cfg, false);
+
+        let results = b.probe(None, URL, 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].ok && results[0].name == "home");
+        assert!(!results[1].ok && results[1].name == "other");
+    }
+
+    #[test]
+    fn probe_missing_tunnel_is_a_hard_error() {
+        let cfg = fixture();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(b.probe(Some("ghost"), URL, 10).unwrap_err().exit_code(), 3);
+    }
+
+    #[test]
+    fn probe_passes_url_and_timeout_to_curl() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK); // curl
+        let b = backend(runner.clone(), &cfg, false);
+        b.probe(Some("home"), "https://example.org/x", 42).unwrap();
+
+        let curl_call = runner
+            .calls()
+            .into_iter()
+            .find(|(p, _)| p == "curl")
+            .unwrap();
+        assert!(curl_call.1.contains(&"--max-time".to_string()));
+        assert!(curl_call.1.contains(&"42".to_string()));
+        assert_eq!(curl_call.1.last().unwrap(), "https://example.org/x");
+    }
+
+    #[test]
+    fn with_programs_overrides_invoked_binaries() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump
+        runner.ok(""); // wg-quick up
+        runner.ok(ALL_DUMP); // status dump
+        let b = backend(runner.clone(), &cfg, false).with_programs(
+            "/abs/wg".to_string(),
+            "/abs/wg-quick".to_string(),
+            "/abs/curl".to_string(),
+        );
+
+        b.up("home").unwrap();
+        let calls = runner.calls();
+        assert_eq!(calls[0].0, "/abs/wg");
+        assert_eq!(calls[1].0, "/abs/wg-quick");
+    }
+
+    #[test]
+    fn with_programs_labels_backend_errors() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump
+        runner.fail(2, "boom"); // wg-quick up fails
+        let b = backend(runner, &cfg, false).with_programs(
+            "/abs/wg".to_string(),
+            "/abs/wg-quick".to_string(),
+            "curl".to_string(),
+        );
+
+        let err = b.up("home").unwrap_err();
+        assert!(matches!(err, Error::Backend { program, .. } if program == "/abs/wg-quick"));
+    }
+
+    #[test]
+    fn config_dir_accessor() {
+        let cfg = fixture();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(b.config_dir(), cfg.path());
+    }
+}

@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+pub mod backend;
 pub mod config;
 pub mod error;
 pub mod probe;
