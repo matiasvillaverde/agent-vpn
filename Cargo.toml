@@ -1,0 +1,30 @@
+[package]
+name = "agent-vpn"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Agent-first WireGuard tunnel manager and multi-location latency prober (binary: vpn)"
+license = "MIT"
+repository = "https://github.com/matiasvillaverde/agent-vpn"
+readme = "README.md"
+keywords = ["wireguard", "vpn", "cli", "latency", "wg-quick"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "vpn"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
