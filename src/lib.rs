@@ -8,3 +8,6 @@
 
 pub mod error;
 pub mod runner;
+
+#[cfg(test)]
+pub(crate) mod testutil;
