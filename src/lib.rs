@@ -9,6 +9,7 @@
 pub mod backend;
 pub mod config;
 pub mod error;
+pub mod output;
 pub mod probe;
 pub mod runner;
 pub mod settings;
