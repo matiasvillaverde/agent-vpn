@@ -86,6 +86,14 @@ becomes vpn's exit code.
 
 ## Install
 
+**Homebrew (macOS/Linux):**
+
+```sh
+brew install matiasvillaverde/tap/agent-vpn   # installs the `vpn` binary
+```
+
+**From source:**
+
 ```sh
 # Runtime dependency: the WireGuard userspace tools.
 brew install wireguard-tools   # macOS
