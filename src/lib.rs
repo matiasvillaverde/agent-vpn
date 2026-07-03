@@ -8,6 +8,7 @@
 #![deny(missing_docs)]
 
 pub mod backend;
+pub mod cidr;
 pub mod cli;
 pub mod config;
 pub mod error;
