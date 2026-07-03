@@ -50,18 +50,32 @@ pub enum Report {
         /// One entry per probed tunnel, successes first (fastest first).
         results: Vec<ProbeResult>,
     },
+    /// Result of `exec`. The child's output has already streamed through, so
+    /// this report is never printed — only its exit code and warning are used.
+    Exec {
+        /// Tunnel name the command ran through.
+        name: String,
+        /// Whether the tunnel was brought up for the run.
+        activated: bool,
+        /// The child's exit code, passed through as vpn's exit code.
+        exit_code: i32,
+        /// Non-fatal problem (e.g. tunnel state could not be restored).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
 }
 
 impl Report {
     /// The process exit code for this (successful) report.
     ///
     /// All reports exit `0` except a probe report containing at least one
-    /// failed probe, which exits `7` so automation can detect partial failures
-    /// without parsing the results.
+    /// failed probe (`7`, so automation can detect partial failures without
+    /// parsing the results) and `exec`, which passes the child's code through.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         match self {
             Report::Probe { results } if results.iter().any(|r| !r.ok) => 7,
+            Report::Exec { exit_code, .. } => *exit_code,
             _ => 0,
         }
     }
@@ -150,6 +164,10 @@ fn human_report(report: &Report) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        // Never printed in practice (see `execute`); rendered for completeness.
+        Report::Exec {
+            name, exit_code, ..
+        } => format!("{name}: command exited {exit_code}"),
     }
 }
 
@@ -480,6 +498,21 @@ mod tests {
         r.error = None;
         let report = Report::Probe { results: vec![r] };
         assert!(render_report(&report, false).contains("unknown error"));
+    }
+
+    #[test]
+    fn exec_report_renders_and_passes_code() {
+        let report = Report::Exec {
+            name: "home".into(),
+            activated: true,
+            exit_code: 42,
+            warning: None,
+        };
+        assert_eq!(report.exit_code(), 42);
+        assert!(render_report(&report, false).contains("exited 42"));
+        let v: Value = serde_json::from_str(&render_report(&report, true)).unwrap();
+        assert_eq!(v["command"], "exec");
+        assert_eq!(v["exit_code"], 42);
     }
 
     #[test]

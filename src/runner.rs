@@ -34,6 +34,13 @@ pub trait CommandRunner {
     /// that runs and exits non-zero is still `Ok` with a non-zero
     /// [`CommandOutput::code`].
     fn run(&self, program: &str, args: &[String]) -> io::Result<CommandOutput>;
+
+    /// Run `program` with `args` with stdio inherited from this process, so
+    /// its output streams directly to the user (used by `vpn exec`).
+    ///
+    /// Returns the exit code, or `None` if the process was killed by a signal.
+    /// `Err` only when the process could not be launched.
+    fn run_passthrough(&self, program: &str, args: &[String]) -> io::Result<Option<i32>>;
 }
 
 /// The real runner, backed by [`std::process::Command`].
@@ -48,6 +55,11 @@ impl CommandRunner for SystemRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn run_passthrough(&self, program: &str, args: &[String]) -> io::Result<Option<i32>> {
+        let status = Command::new(program).args(args).status()?;
+        Ok(status.code())
     }
 }
 
@@ -100,6 +112,26 @@ mod tests {
     fn system_runner_reports_spawn_failure() {
         let err = SystemRunner
             .run("vpn-no-such-binary-zzz", &[])
+            .expect_err("should fail to spawn");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn passthrough_returns_exit_code() {
+        let code = SystemRunner
+            .run_passthrough("sh", &["-c".into(), "exit 7".into()])
+            .expect("spawn");
+        assert_eq!(code, Some(7));
+        let code = SystemRunner
+            .run_passthrough("sh", &["-c".into(), "true".into()])
+            .expect("spawn");
+        assert_eq!(code, Some(0));
+    }
+
+    #[test]
+    fn passthrough_reports_spawn_failure() {
+        let err = SystemRunner
+            .run_passthrough("vpn-no-such-binary-zzz", &[])
             .expect_err("should fail to spawn");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }

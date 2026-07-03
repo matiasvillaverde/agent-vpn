@@ -268,6 +268,60 @@ fn probe_all_covers_every_tunnel() {
 }
 
 #[test]
+fn exec_streams_output_passes_code_and_restores() {
+    let env = setup();
+
+    // Child output streams through; its exit code becomes vpn's.
+    env.cmd()
+        .args([
+            "exec",
+            "home",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo through-the-tunnel",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("through-the-tunnel"));
+
+    let assert = env
+        .cmd()
+        .args(["exec", "home", "--", "/bin/sh", "-c", "exit 7"])
+        .assert()
+        .failure();
+    assert_eq!(assert.get_output().status.code().unwrap(), 7);
+
+    // Tunnel restored to down after both runs.
+    let (v, _) = env.json(&["status", "home"]);
+    assert_eq!(v["tunnels"][0]["up"], false);
+}
+
+#[test]
+fn exec_on_running_tunnel_leaves_it_up() {
+    let env = setup();
+    env.json(&["up", "home"]);
+    env.cmd()
+        .args(["exec", "home", "--", "/bin/sh", "-c", "true"])
+        .assert()
+        .success();
+    let (v, _) = env.json(&["status", "home"]);
+    assert_eq!(v["tunnels"][0]["up"], true);
+    env.json(&["down", "home"]);
+}
+
+#[test]
+fn exec_unknown_tunnel_exits_3() {
+    let env = setup();
+    let assert = env
+        .cmd()
+        .args(["exec", "ghost", "--", "/bin/sh", "-c", "true"])
+        .assert()
+        .failure();
+    assert_eq!(assert.get_output().status.code().unwrap(), 3);
+}
+
+#[test]
 fn sibling_configs_do_not_shadow_each_other() {
     let env = setup();
     // Same peer key as home, different AllowedIPs (split tunnel).

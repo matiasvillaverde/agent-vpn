@@ -133,6 +133,16 @@ pub enum Command {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         count: u32,
     },
+    /// Run a command with the tunnel up (activating it if needed, restoring
+    /// afterwards); the command's stdio streams through and its exit code
+    /// becomes vpn's exit code. Usage: `vpn exec <name> -- <command...>`.
+    Exec {
+        /// Tunnel name (config file stem).
+        name: String,
+        /// The command to run (after `--`); always runs unprivileged.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 /// The default config directory, `$HOME/.config/vpn`.
@@ -187,6 +197,15 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         } => Ok(Report::Probe {
             results: backend.probe(name.as_deref(), url, *max_time, *count)?,
         }),
+        Command::Exec { name, command } => {
+            let outcome = backend.exec_through(name, command)?;
+            Ok(Report::Exec {
+                name: outcome.name,
+                activated: outcome.activated,
+                exit_code: outcome.exit_code,
+                warning: outcome.warning,
+            })
+        }
     }
 }
 
@@ -276,6 +295,59 @@ mod tests {
     #[test]
     fn cli_rejects_zero_count() {
         assert!(Cli::try_parse_from(["vpn", "probe", "--count", "0"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_exec_after_separator() {
+        let cli = Cli::try_parse_from([
+            "vpn",
+            "exec",
+            "proton",
+            "--",
+            "curl",
+            "-sI",
+            "https://x.example",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Exec { name, command } => {
+                assert_eq!(name, "proton");
+                assert_eq!(command, vec!["curl", "-sI", "https://x.example"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // A command is mandatory.
+        assert!(Cli::try_parse_from(["vpn", "exec", "proton"]).is_err());
+    }
+
+    #[test]
+    fn dispatch_exec() {
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.fail(3, ""); // child exits 3
+        let (b, _cfg) = backend_with(runner);
+        let report = dispatch(
+            &b,
+            &Command::Exec {
+                name: "home".into(),
+                command: vec!["true".into()],
+            },
+        )
+        .unwrap();
+        match report {
+            Report::Exec {
+                name,
+                activated,
+                exit_code,
+                warning,
+            } => {
+                assert_eq!(name, "home");
+                assert!(!activated);
+                assert_eq!(exit_code, 3);
+                assert!(warning.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

@@ -341,6 +341,72 @@ impl<R: CommandRunner> Backend<R> {
     }
 }
 
+/// The outcome of running a command through a tunnel via `vpn exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutcome {
+    /// Tunnel name the command ran through.
+    pub name: String,
+    /// Whether the tunnel was brought up for this run (and torn down after).
+    pub activated: bool,
+    /// The child's exit code (`1` if it was killed by a signal).
+    pub exit_code: i32,
+    /// Non-fatal problem (e.g. the tunnel state could not be restored).
+    pub warning: Option<String>,
+}
+
+impl<R: CommandRunner> Backend<R> {
+    /// Run `command` with the tunnel up, streaming its stdio straight through,
+    /// then restore the tunnel's previous up/down state.
+    ///
+    /// The child always runs unprivileged (never under sudo). A tunnel that
+    /// cannot be brought up is a hard error; a child that cannot be spawned is
+    /// reported as [`Error::Spawn`] *after* the tunnel state is restored.
+    pub fn exec_through(&self, name: &str, command: &[String]) -> Result<ExecOutcome> {
+        let tunnel = config::resolve(&self.config_dir, name)?;
+        let dump = self.all_dump()?;
+        let was_up = self.find_live(&tunnel, &dump)?.is_some();
+        let path = tunnel.path.to_string_lossy().into_owned();
+
+        if !was_up {
+            let out = self.exec(&self.wg_quick, &["up", &path])?;
+            if !out.success() {
+                return Err(backend_error(&self.wg_quick, &out));
+            }
+        }
+
+        let (program, args) = command.split_first().expect("clap requires a command");
+        let child = self.runner.run_passthrough(program, args);
+
+        let mut warning = None;
+        if !was_up {
+            match self.exec(&self.wg_quick, &["down", &path]) {
+                Ok(out) if out.success() => {}
+                Ok(out) => {
+                    warning = Some(format!(
+                        "failed to restore tunnel state: {}",
+                        backend_error(&self.wg_quick, &out)
+                    ));
+                }
+                Err(e) => warning = Some(format!("failed to restore tunnel state: {e}")),
+            }
+        }
+
+        match child {
+            Err(source) => Err(Error::Spawn {
+                program: program.clone(),
+                source,
+            }),
+            Ok(code) => Ok(ExecOutcome {
+                name: name.to_string(),
+                activated: !was_up,
+                // Signal-killed children have no code; report a generic failure.
+                exit_code: code.unwrap_or(1),
+                warning,
+            }),
+        }
+    }
+}
+
 /// Build the `(program, args)` to launch, applying the optional `sudo -n`
 /// prefix (`-n` = never prompt; fail immediately if a password would be
 /// required).
@@ -1020,6 +1086,123 @@ mod tests {
         assert!(curl_call.1.contains(&"--max-time".to_string()));
         assert!(curl_call.1.contains(&"42".to_string()));
         assert_eq!(curl_call.1.last().unwrap(), "https://example.org/x");
+    }
+
+    fn cmd(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn exec_activates_runs_child_unprivileged_and_restores() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down
+        runner.ok(""); // wg-quick up
+        runner.fail(42, ""); // child exits 42 (passthrough reads code)
+        runner.ok(""); // wg-quick down
+        let b = backend(runner.clone(), &cfg, true);
+
+        let outcome = b
+            .exec_through("home", &cmd(&["curl", "-sI", "https://x.example"]))
+            .unwrap();
+        assert!(outcome.activated);
+        assert_eq!(outcome.exit_code, 42);
+        assert!(outcome.warning.is_none());
+
+        // sudo wraps only the wg calls; the child runs bare.
+        let calls = runner.calls();
+        let programs: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(programs, vec!["sudo", "sudo", "curl", "sudo"]);
+        assert_eq!(calls[2].1, vec!["-sI", "https://x.example"]);
+        assert_eq!(calls[3].1[1], "wg-quick");
+        assert_eq!(calls[3].1[2], "down");
+    }
+
+    #[test]
+    fn exec_on_running_tunnel_leaves_it_up() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(""); // child exits 0
+        let b = backend(runner.clone(), &cfg, false);
+
+        let outcome = b.exec_through("home", &cmd(&["true"])).unwrap();
+        assert!(!outcome.activated);
+        assert_eq!(outcome.exit_code, 0);
+        assert!(runner.calls().iter().all(|(p, _)| p != "wg-quick"));
+    }
+
+    #[test]
+    fn exec_up_failure_is_hard_error() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.fail(1, "no permission"); // wg-quick up fails
+        let b = backend(runner.clone(), &cfg, false);
+        assert_eq!(
+            b.exec_through("home", &cmd(&["true"]))
+                .unwrap_err()
+                .exit_code(),
+            5
+        );
+        assert_eq!(runner.calls().len(), 2, "child never ran");
+    }
+
+    #[test]
+    fn exec_child_spawn_failure_still_restores() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.spawn_err(); // child missing
+        runner.ok(""); // restore
+        let b = backend(runner.clone(), &cfg, false);
+
+        let err = b.exec_through("home", &cmd(&["nope"])).unwrap_err();
+        assert_eq!(err.exit_code(), 6);
+        let last = runner.calls().last().unwrap().clone();
+        assert_eq!(last.1[0], "down", "restore ran despite spawn failure");
+    }
+
+    #[test]
+    fn exec_restore_failure_becomes_warning() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(""); // child ok
+        runner.fail(1, "cannot remove"); // restore fails
+        let b = backend(runner, &cfg, false);
+
+        let outcome = b.exec_through("home", &cmd(&["true"])).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn exec_signal_killed_child_reports_code_1() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.signal_killed(); // child killed by signal
+        let b = backend(runner, &cfg, false);
+        assert_eq!(b.exec_through("home", &cmd(&["x"])).unwrap().exit_code, 1);
+    }
+
+    #[test]
+    fn exec_missing_tunnel() {
+        let cfg = fixture();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(
+            b.exec_through("ghost", &cmd(&["true"]))
+                .unwrap_err()
+                .exit_code(),
+            3
+        );
     }
 
     #[test]

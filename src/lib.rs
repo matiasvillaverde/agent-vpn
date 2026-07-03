@@ -60,6 +60,16 @@ pub fn execute<R: CommandRunner>(runner: R, cli: &Cli) -> Execution {
         effective.curl,
     );
     match cli::dispatch(&backend, &cli.command) {
+        // exec: the child's output already streamed through — emit nothing on
+        // stdout (a report would corrupt piped output) and pass its code on.
+        // A restore warning is the only thing worth saying, on stderr.
+        Ok(output::Report::Exec {
+            exit_code, warning, ..
+        }) => Execution {
+            is_error: warning.is_some(),
+            message: warning.unwrap_or_default(),
+            code: exit_code,
+        },
         Ok(report) => Execution {
             message: output::render_report(&report, cli.json),
             // 0 for every report except a probe with failures (7).
@@ -79,7 +89,9 @@ pub fn execute<R: CommandRunner>(runner: R, cli: &Cli) -> Execution {
 #[must_use]
 pub fn run_cli(cli: Cli) -> ExitCode {
     let execution = execute(SystemRunner, &cli);
-    if execution.is_error {
+    if execution.message.is_empty() {
+        // exec success: the child's output was the output.
+    } else if execution.is_error {
         eprintln!("{}", execution.message);
     } else {
         println!("{}", execution.message);
@@ -152,6 +164,58 @@ mod tests {
         assert_eq!(ex.code, 1);
         assert!(ex.is_error);
         assert!(ex.message.contains("unknown key 'bogus'"));
+    }
+
+    #[test]
+    fn execute_exec_passes_child_code_and_stays_silent() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("home.conf"), CONF).unwrap();
+        let cli = Cli::try_parse_from([
+            "vpn",
+            "--config-dir",
+            cfg.path().to_str().unwrap(),
+            "exec",
+            "home",
+            "--",
+            "some-command",
+        ])
+        .unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down
+        runner.ok(""); // wg-quick up
+        runner.fail(9, ""); // child exits 9
+        runner.ok(""); // restore
+        let ex = execute(runner, &cli);
+        assert_eq!(ex.code, 9);
+        assert!(!ex.is_error);
+        assert!(ex.message.is_empty(), "exec emits nothing of its own");
+    }
+
+    #[test]
+    fn execute_exec_restore_warning_goes_to_stderr() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("home.conf"), CONF).unwrap();
+        let cli = Cli::try_parse_from([
+            "vpn",
+            "--config-dir",
+            cfg.path().to_str().unwrap(),
+            "exec",
+            "home",
+            "--",
+            "some-command",
+        ])
+        .unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(""); // child ok
+        runner.fail(1, "boom"); // restore fails
+        let ex = execute(runner, &cli);
+        assert_eq!(ex.code, 0, "child's code wins even with a warning");
+        assert!(ex.is_error, "warning goes to stderr");
+        assert!(ex.message.contains("failed to restore"));
     }
 
     #[test]

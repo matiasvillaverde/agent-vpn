@@ -51,6 +51,15 @@ impl MockRunner {
         self.push(Err(io::Error::new(io::ErrorKind::NotFound, "missing")))
     }
 
+    /// Queue a signal-killed response (process ran but has no exit code).
+    pub fn signal_killed(&self) -> &Self {
+        self.push(Ok(CommandOutput {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        }))
+    }
+
     /// The `(program, args)` of every call made so far, in order.
     pub fn calls(&self) -> Vec<(String, Vec<String>)> {
         self.inner.calls.borrow().clone()
@@ -80,6 +89,18 @@ impl CommandRunner for MockRunner {
                 })
             })
     }
+
+    fn run_passthrough(&self, program: &str, args: &[String]) -> io::Result<Option<i32>> {
+        self.inner
+            .calls
+            .borrow_mut()
+            .push((program.to_string(), args.to_vec()));
+        match self.inner.responses.borrow_mut().pop_front() {
+            Some(Ok(out)) => Ok(out.code),
+            Some(Err(e)) => Err(e),
+            None => Ok(Some(0)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -108,5 +129,16 @@ mod tests {
             mock.run("c", &[]).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn passthrough_replays_codes_and_spawn_errors() {
+        let mock = MockRunner::new();
+        mock.fail(7, "").spawn_err();
+        assert_eq!(mock.run_passthrough("a", &[]).unwrap(), Some(7));
+        assert!(mock.run_passthrough("b", &[]).is_err());
+        // Unscripted default is success.
+        assert_eq!(mock.run_passthrough("c", &[]).unwrap(), Some(0));
+        assert_eq!(mock.calls().len(), 3);
     }
 }
