@@ -143,6 +143,13 @@ pub enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Statically check tunnel configs for problems (missing keys, and
+    /// split-tunnel AllowedIPs that cover their own Endpoint — a routing
+    /// loop). Exits 1 if any config has errors.
+    Lint {
+        /// Tunnel name; omit to lint every config.
+        name: Option<String>,
+    },
 }
 
 /// The default config directory, `$HOME/.config/vpn`.
@@ -206,6 +213,9 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
                 warning: outcome.warning,
             })
         }
+        Command::Lint { name } => Ok(Report::Lint {
+            results: backend.lint(name.as_deref())?,
+        }),
     }
 }
 

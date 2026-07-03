@@ -361,6 +361,34 @@ fn human_output_is_readable() {
 }
 
 #[test]
+fn lint_flags_routing_loops_and_exits_1() {
+    let env = setup();
+    // A split tunnel whose AllowedIPs cover its own endpoint.
+    fs::write(
+        env.config_dir.path().join("broken.conf"),
+        "[Interface]\nPrivateKey = P=\n[Peer]\nPublicKey = B=\n\
+         AllowedIPs = 64.0.0.0/3, 128.0.0.0/1\nEndpoint = 79.127.160.216:51820\n",
+    )
+    .unwrap();
+
+    let (v, code) = env.json(&["lint"]);
+    assert_eq!(code, 1);
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    let broken = results.iter().find(|r| r["name"] == "broken").unwrap();
+    assert_eq!(broken["ok"], false);
+    assert!(broken["findings"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("routing loop"));
+
+    // Linting only the clean config passes.
+    let (v, code) = env.json(&["lint", "home"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["results"][0]["ok"], true);
+}
+
+#[test]
 fn unknown_tunnel_exits_3() {
     let env = setup();
     let (v, code) = env.json(&["up", "ghost"]);

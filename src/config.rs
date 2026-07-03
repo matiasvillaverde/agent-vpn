@@ -141,6 +141,84 @@ pub fn peer_identity(path: &Path) -> Result<PeerIdentity> {
     }
 }
 
+/// A structural summary of a tunnel config, used by `lint` and `split`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfSummary {
+    /// Whether `[Interface]` has a `PrivateKey`.
+    pub has_private_key: bool,
+    /// The first peer's `PublicKey`, if any.
+    pub peer_public_key: Option<String>,
+    /// The first peer's raw `AllowedIPs` entries (trimmed, unnormalized).
+    pub allowed_ips: Vec<String>,
+    /// The first peer's `Endpoint`, if any.
+    pub endpoint: Option<String>,
+    /// Whether `[Interface]` sets `DNS`.
+    pub has_dns: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Section {
+    None,
+    Interface,
+    FirstPeer,
+}
+
+/// Parse the structural summary of a tunnel config. Uses the same comment and
+/// case-insensitivity rules as [`peer_identity`].
+pub fn conf_summary(path: &Path) -> Result<ConfSummary> {
+    let text = fs::read_to_string(path).map_err(|source| Error::TunnelConfRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut summary = ConfSummary::default();
+    let mut section = Section::None;
+    let mut seen_peer = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            section = if line.eq_ignore_ascii_case("[interface]") {
+                Section::Interface
+            } else if line.eq_ignore_ascii_case("[peer]") && !seen_peer {
+                seen_peer = true;
+                Section::FirstPeer
+            } else {
+                Section::None
+            };
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match section {
+            Section::Interface => {
+                if key.eq_ignore_ascii_case("privatekey") && !value.is_empty() {
+                    summary.has_private_key = true;
+                } else if key.eq_ignore_ascii_case("dns") {
+                    summary.has_dns = true;
+                }
+            }
+            Section::FirstPeer => {
+                if key.eq_ignore_ascii_case("publickey") && summary.peer_public_key.is_none() {
+                    summary.peer_public_key = Some(value.to_string());
+                } else if key.eq_ignore_ascii_case("allowedips") {
+                    summary
+                        .allowed_ips
+                        .extend(value.split(',').map(|s| s.trim().to_string()));
+                } else if key.eq_ignore_ascii_case("endpoint") && summary.endpoint.is_none() {
+                    summary.endpoint = Some(value.to_string());
+                }
+            }
+            Section::None => {}
+        }
+    }
+    Ok(summary)
+}
+
 /// Resolve a single named tunnel to its config file.
 ///
 /// Errors with [`Error::InvalidName`] for an illegal name and
@@ -349,5 +427,52 @@ mod tests {
         let err = peer_identity(&dir.path().join("missing.conf")).unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("could not be read"));
+    }
+
+    #[test]
+    fn conf_summary_full_config() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(
+            dir.path(),
+            "t",
+            "[Interface]\nPrivateKey = PRIV=\nAddress = 10.0.0.2/32\nDNS = 10.2.0.1\n\n\
+             [Peer]\nPublicKey = PEER=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n",
+        );
+        let s = conf_summary(&path).unwrap();
+        assert!(s.has_private_key);
+        assert!(s.has_dns);
+        assert_eq!(s.peer_public_key.as_deref(), Some("PEER="));
+        assert_eq!(s.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
+        assert_eq!(s.endpoint.as_deref(), Some("1.2.3.4:51820"));
+    }
+
+    #[test]
+    fn conf_summary_minimal_and_second_peer_ignored() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(
+            dir.path(),
+            "t",
+            "[Peer]\nPublicKey = FIRST\n\n[Peer]\nPublicKey = SECOND\nEndpoint = 9.9.9.9:1\n",
+        );
+        let s = conf_summary(&path).unwrap();
+        assert!(!s.has_private_key);
+        assert!(!s.has_dns);
+        assert_eq!(s.peer_public_key.as_deref(), Some("FIRST"));
+        assert!(s.allowed_ips.is_empty());
+        assert_eq!(s.endpoint, None, "second peer's endpoint must not leak in");
+    }
+
+    #[test]
+    fn conf_summary_empty_private_key_does_not_count() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(dir.path(), "t", "[Interface]\nPrivateKey =\n");
+        assert!(!conf_summary(&path).unwrap().has_private_key);
+    }
+
+    #[test]
+    fn conf_summary_unreadable_file_errors() {
+        let dir = tempdir().unwrap();
+        let err = conf_summary(&dir.path().join("missing.conf")).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
     }
 }

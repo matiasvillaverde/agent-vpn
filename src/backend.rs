@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, Tunnel};
 use crate::error::{Error, Result};
+use crate::lint;
 use crate::probe::{self, ProbeResult};
 use crate::runner::{CommandOutput, CommandRunner};
 use crate::status::{self, DumpPeer, ListEntry, TunnelStatus};
@@ -338,6 +339,24 @@ impl<R: CommandRunner> Backend<R> {
             }
         }
         Ok(result)
+    }
+}
+
+impl<R: CommandRunner> Backend<R> {
+    /// Lint one named tunnel, or every discovered tunnel. Pure file analysis —
+    /// no privileged commands run.
+    pub fn lint(&self, name: Option<&str>) -> Result<Vec<lint::LintResult>> {
+        let tunnels = match name {
+            Some(n) => vec![config::resolve(&self.config_dir, n)?],
+            None => config::discover(&self.config_dir)?,
+        };
+        tunnels
+            .iter()
+            .map(|t| {
+                let summary = config::conf_summary(&t.path)?;
+                Ok(lint::lint(&t.name, &summary))
+            })
+            .collect()
     }
 }
 
@@ -1203,6 +1222,30 @@ mod tests {
                 .exit_code(),
             3
         );
+    }
+
+    #[test]
+    fn lint_checks_one_or_all_configs() {
+        let cfg = fixture(); // clean home.conf
+        fs::write(
+            cfg.path().join("loop.conf"),
+            "[Interface]\nPrivateKey = P\n[Peer]\nPublicKey = K\n\
+             AllowedIPs = 64.0.0.0/3\nEndpoint = 79.127.160.216:51820\n",
+        )
+        .unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        let all = b.lint(None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].ok, "home is clean");
+        assert!(!all[1].ok, "loop.conf has the routing loop");
+        assert!(all[1].findings[0].message.contains("routing loop"));
+
+        let one = b.lint(Some("home")).unwrap();
+        assert_eq!(one.len(), 1);
+        assert!(one[0].ok);
+
+        assert_eq!(b.lint(Some("ghost")).unwrap_err().exit_code(), 3);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod cidr;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod lint;
 pub mod output;
 pub mod probe;
 pub mod runner;

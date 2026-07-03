@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::error::Error;
+use crate::lint::{LintResult, Severity};
 use crate::probe::ProbeResult;
 use crate::status::{ListEntry, TunnelStatus};
 
@@ -63,6 +64,11 @@ pub enum Report {
         #[serde(skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
     },
+    /// Result of `lint`.
+    Lint {
+        /// One entry per linted config.
+        results: Vec<LintResult>,
+    },
 }
 
 impl Report {
@@ -76,6 +82,7 @@ impl Report {
         match self {
             Report::Probe { results } if results.iter().any(|r| !r.ok) => 7,
             Report::Exec { exit_code, .. } => *exit_code,
+            Report::Lint { results } if results.iter().any(|r| !r.ok) => 1,
             _ => 0,
         }
     }
@@ -168,7 +175,32 @@ fn human_report(report: &Report) -> String {
         Report::Exec {
             name, exit_code, ..
         } => format!("{name}: command exited {exit_code}"),
+        Report::Lint { results } => {
+            if results.is_empty() {
+                return "no tunnels".to_string();
+            }
+            results
+                .iter()
+                .map(lint_lines)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
+}
+
+fn lint_lines(r: &LintResult) -> String {
+    if r.findings.is_empty() {
+        return format!("ok    {}", r.name);
+    }
+    let mut out = format!("{}{}", if r.ok { "warn  " } else { "FAIL  " }, r.name);
+    for finding in &r.findings {
+        let tag = match finding.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        };
+        out.push_str(&format!("\n      {tag}: {}", finding.message));
+    }
+    out
 }
 
 fn state_word(up: bool) -> &'static str {
@@ -513,6 +545,59 @@ mod tests {
         let v: Value = serde_json::from_str(&render_report(&report, true)).unwrap();
         assert_eq!(v["command"], "exec");
         assert_eq!(v["exit_code"], 42);
+    }
+
+    #[test]
+    fn lint_report_renders_and_exit_codes() {
+        use crate::lint::{Finding, LintResult, Severity};
+        let clean = LintResult {
+            name: "good".into(),
+            ok: true,
+            findings: vec![],
+        };
+        let warned = LintResult {
+            name: "meh".into(),
+            ok: true,
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                message: "no Endpoint".into(),
+            }],
+        };
+        let broken = LintResult {
+            name: "bad".into(),
+            ok: false,
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "routing loop: X".into(),
+            }],
+        };
+
+        let ok_report = Report::Lint {
+            results: vec![clean.clone(), warned.clone()],
+        };
+        assert_eq!(ok_report.exit_code(), 0, "warnings alone pass");
+        let text = render_report(&ok_report, false);
+        assert!(text.contains("ok    good"));
+        assert!(text.contains("warn  meh"));
+        assert!(text.contains("warning: no Endpoint"));
+
+        let bad_report = Report::Lint {
+            results: vec![clean, broken],
+        };
+        assert_eq!(bad_report.exit_code(), 1);
+        let text = render_report(&bad_report, false);
+        assert!(text.contains("FAIL  bad"));
+        assert!(text.contains("error: routing loop"));
+
+        let v: Value = serde_json::from_str(&render_report(&bad_report, true)).unwrap();
+        assert_eq!(v["command"], "lint");
+        assert_eq!(v["results"][1]["ok"], false);
+        assert_eq!(v["results"][1]["findings"][0]["severity"], "error");
+
+        assert_eq!(
+            render_report(&Report::Lint { results: vec![] }, false),
+            "no tunnels"
+        );
     }
 
     #[test]

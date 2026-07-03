@@ -127,7 +127,9 @@ fn exclude_one(net: Cidr4, hole: Cidr4) -> Vec<Cidr4> {
         return vec![net]; // disjoint: net survives whole
     }
     // net strictly contains hole: split and recurse into the half holding it.
-    let (lo, hi) = net.halves().expect("strict containment implies prefix < 32");
+    let (lo, hi) = net
+        .halves()
+        .expect("strict containment implies prefix < 32");
     let mut out = Vec::new();
     out.extend(exclude_one(lo, hole));
     out.extend(exclude_one(hi, hole));
