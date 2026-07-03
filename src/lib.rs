@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod lint;
+pub mod lock;
 pub mod output;
 pub mod probe;
 pub mod runner;
@@ -56,6 +57,32 @@ pub fn execute<R: CommandRunner>(runner: R, cli: &Cli) -> Execution {
         }
     };
     let effective = cli.settings(&file);
+    // Serialize state-mutating commands across concurrent vpn invocations so
+    // two agents cannot interleave each other's up/probe/down sequences.
+    // Read-only commands stay lock-free.
+    let needs_lock = matches!(
+        cli.command,
+        cli::Command::Up { .. }
+            | cli::Command::Down { .. }
+            | cli::Command::Probe { .. }
+            | cli::Command::Exec { .. }
+            | cli::Command::Add { .. }
+            | cli::Command::Split { .. }
+    );
+    let _lock = if needs_lock {
+        match lock::Lock::acquire(&effective.config_dir) {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                return Execution {
+                    message: output::render_error(&err, cli.json),
+                    code: err.exit_code(),
+                    is_error: true,
+                }
+            }
+        }
+    } else {
+        None
+    };
     let backend = Backend::new(runner, effective.config_dir, effective.sudo).with_programs(
         effective.wg,
         effective.wg_quick,
