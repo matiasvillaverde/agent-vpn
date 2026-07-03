@@ -475,4 +475,14 @@ mod tests {
         let err = conf_summary(&dir.path().join("missing.conf")).unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
+
+    #[test]
+    fn conf_summary_skips_non_kv_lines() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(dir.path(), "t", "[Peer]\nnoise line\nPublicKey = K\n");
+        assert_eq!(
+            conf_summary(&path).unwrap().peer_public_key.as_deref(),
+            Some("K")
+        );
+    }
 }

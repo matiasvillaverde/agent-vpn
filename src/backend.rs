@@ -1861,6 +1861,134 @@ mod tests {
     }
 
     #[test]
+    fn split_rejects_hostname_endpoint() {
+        let cfg = tempdir().unwrap();
+        fs::write(
+            cfg.path().join("host.conf"),
+            "[Interface]\nPrivateKey = P\n[Peer]\nPublicKey = K\n\
+             AllowedIPs = 0.0.0.0/0\nEndpoint = vpn.example.com:51820\n",
+        )
+        .unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+        let err = b.split("host", &[], None, false, false).unwrap_err();
+        assert!(err.to_string().contains("not an IPv4 address"));
+    }
+
+    #[test]
+    fn exec_restore_spawn_failure_becomes_warning() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // down
+        runner.ok(""); // up
+        runner.ok(""); // child ok
+        runner.spawn_err(); // restore cannot launch wg-quick
+        let b = backend(runner, &cfg, false);
+
+        let outcome = b.exec_through("home", &cmd(&["true"])).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn doctor_handles_sudo_spawn_error_and_version_failures() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.fail(127, ""); // wg --version exits non-zero
+        runner.fail(1, "usage"); // wg-quick found
+        runner.ok("curl 8\n"); // curl fine
+        runner.spawn_err(); // sudo itself missing
+        runner.ok(ALL_DUMP); // dump
+        let b = backend(runner, &cfg, true);
+
+        let checks = b.doctor();
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        assert!(!by_name("wg").ok);
+        assert!(by_name("wg").detail.contains("exited 127"));
+        assert!(!by_name("sudo").ok);
+        assert!(by_name("sudo").detail.contains("cannot run sudo"));
+    }
+
+    #[test]
+    fn doctor_reports_unreadable_config_dir() {
+        // config_dir whose parent is a regular file cannot be read.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("iamafile");
+        fs::write(&file, "x").unwrap();
+        let runner = MockRunner::new();
+        runner.ok("wg v1\n");
+        runner.fail(1, "usage");
+        runner.ok("curl 8\n");
+        runner.ok("");
+        let b = Backend::new(runner, file.join("sub"), false);
+
+        let checks = b.doctor();
+        let dir_check = checks.iter().find(|c| c.name == "config dir").unwrap();
+        assert!(!dir_check.ok);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_reports_unreadable_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let cfg = fixture();
+        fs::set_permissions(
+            cfg.path().join("home.conf"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let runner = MockRunner::new();
+        runner.ok("wg v1\n");
+        runner.fail(1, "usage");
+        runner.ok("curl 8\n");
+        runner.ok("");
+        let b = backend(runner, &cfg, false);
+
+        let checks = b.doctor();
+        let conf = checks.iter().find(|c| c.name == "config:home").unwrap();
+        assert!(!conf.ok);
+        // Restore perms so TempDir cleanup works everywhere.
+        fs::set_permissions(
+            cfg.path().join("home.conf"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn doctor_notes_warnings_on_passing_configs() {
+        let cfg = tempdir().unwrap();
+        fs::write(
+            cfg.path().join("srv.conf"),
+            "[Interface]\nPrivateKey = P\n[Peer]\nPublicKey = K\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                cfg.path().join("srv.conf"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let runner = MockRunner::new();
+        runner.ok("wg v1\n");
+        runner.fail(1, "usage");
+        runner.ok("curl 8\n");
+        runner.ok("");
+        let b = backend(runner, &cfg, false);
+
+        let checks = b.doctor();
+        let conf = checks.iter().find(|c| c.name == "config:srv").unwrap();
+        assert!(conf.ok, "warnings don't fail doctor");
+        assert!(conf.detail.contains("no Endpoint"));
+    }
+
+    #[test]
     fn rewrite_split_handles_multiple_allowedips_and_missing() {
         let text =
             "[Peer]\nAllowedIPs = 10.0.0.0/8\nAllowedIPs = 172.16.0.0/12\nEndpoint = 1.2.3.4:1\n";

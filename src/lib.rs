@@ -196,6 +196,27 @@ mod tests {
     }
 
     #[test]
+    fn execute_reports_lock_setup_failure() {
+        // A config dir that cannot be created (parent is a file) makes the
+        // lock acquisition fail cleanly for a mutating command.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("iamafile");
+        fs::write(&file, "x").unwrap();
+        let cli = Cli::try_parse_from([
+            "vpn",
+            "--config-dir",
+            file.join("sub").to_str().unwrap(),
+            "up",
+            "home",
+        ])
+        .unwrap();
+
+        let ex = execute(MockRunner::new(), &cli);
+        assert_eq!(ex.code, 1);
+        assert!(ex.is_error);
+    }
+
+    #[test]
     fn execute_exec_passes_child_code_and_stays_silent() {
         let cfg = tempdir().unwrap();
         fs::write(cfg.path().join("home.conf"), CONF).unwrap();

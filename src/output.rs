@@ -656,6 +656,81 @@ mod tests {
     }
 
     #[test]
+    fn add_and_split_reports_render() {
+        use crate::lint::{Finding, LintResult, Severity};
+        let add = Report::Add {
+            name: "proton-jp".into(),
+            path: "/cfg/proton-jp.conf".into(),
+            lint: LintResult {
+                name: "proton-jp".into(),
+                ok: true,
+                findings: vec![Finding {
+                    severity: Severity::Warning,
+                    message: "no Endpoint".into(),
+                }],
+            },
+        };
+        let text = render_report(&add, false);
+        assert!(text.contains("added proton-jp (/cfg/proton-jp.conf)"));
+        assert!(text.contains("note: no Endpoint"));
+        let v: Value = serde_json::from_str(&render_report(&add, true)).unwrap();
+        assert_eq!(v["command"], "add");
+        assert_eq!(v["lint"]["ok"], true);
+
+        let split = Report::Split {
+            source: "proton-jp".into(),
+            name: "proton-jp-ts".into(),
+            path: "/cfg/proton-jp-ts.conf".into(),
+            entries: 39,
+        };
+        let text = render_report(&split, false);
+        assert!(text.contains("proton-jp-ts: split tunnel of proton-jp"));
+        assert!(text.contains("39 AllowedIPs entries"));
+        let v: Value = serde_json::from_str(&render_report(&split, true)).unwrap();
+        assert_eq!(v["command"], "split");
+        assert_eq!(v["entries"], 39);
+
+        assert_eq!(add.exit_code(), 0);
+        assert_eq!(split.exit_code(), 0);
+    }
+
+    #[test]
+    fn doctor_report_renders_and_exit_codes() {
+        use crate::backend::Check;
+        let report = Report::Doctor {
+            checks: vec![
+                Check {
+                    name: "wg".into(),
+                    ok: true,
+                    detail: "wireguard-tools v1".into(),
+                },
+                Check {
+                    name: "sudo".into(),
+                    ok: false,
+                    detail: "add a NOPASSWD rule".into(),
+                },
+            ],
+        };
+        assert_eq!(report.exit_code(), 1);
+        let text = render_report(&report, false);
+        assert!(text.contains("ok   wg"));
+        assert!(text.contains("FAIL sudo"));
+        assert!(text.contains("NOPASSWD"));
+        let v: Value = serde_json::from_str(&render_report(&report, true)).unwrap();
+        assert_eq!(v["command"], "doctor");
+        assert_eq!(v["checks"][1]["ok"], false);
+
+        let healthy = Report::Doctor {
+            checks: vec![Check {
+                name: "wg".into(),
+                ok: true,
+                detail: "x".into(),
+            }],
+        };
+        assert_eq!(healthy.exit_code(), 0);
+    }
+
+    #[test]
     fn report_exit_codes() {
         assert_eq!(Report::Current { active: vec![] }.exit_code(), 0);
         assert_eq!(
