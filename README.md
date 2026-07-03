@@ -86,20 +86,19 @@ becomes vpn's exit code.
 
 ## Install
 
-**Homebrew (macOS/Linux):**
+**Homebrew (macOS/Linux)** — pulls in `wireguard-tools` automatically:
 
 ```sh
 brew install matiasvillaverde/tap/agent-vpn   # installs the `vpn` binary
 ```
 
-**From source:**
+**Cargo** — needs `wireguard-tools` on the system separately:
 
 ```sh
-# Runtime dependency: the WireGuard userspace tools.
+cargo install agent-vpn                       # installs the `vpn` binary
+
 brew install wireguard-tools   # macOS
 # sudo apt install wireguard-tools   # Debian/Ubuntu
-
-cargo install --path .
 ```
 
 Then add locations. Using ProtonVPN? Follow the step-by-step guide in
