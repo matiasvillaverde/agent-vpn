@@ -194,6 +194,22 @@ fn probe_activates_and_restores() {
 }
 
 #[test]
+fn probe_count_reports_stats() {
+    let env = setup();
+    let (v, code) = env.json(&["probe", "home", "--count", "3"]);
+    assert_eq!(code, 0);
+    let r = &v["results"][0];
+    assert_eq!(r["samples"], 3);
+    assert_eq!(r["failures"], 0);
+    assert_eq!(r["stats"]["median_total_ms"], 291.0);
+    assert_eq!(r["stats"]["min_total_ms"], 291.0);
+    assert_eq!(r["stats"]["max_total_ms"], 291.0);
+    // Restored afterwards.
+    let (v, _) = env.json(&["status", "home"]);
+    assert_eq!(v["tunnels"][0]["up"], false);
+}
+
+#[test]
 fn probe_leaves_running_tunnel_up() {
     let env = setup();
     env.json(&["up", "home"]);

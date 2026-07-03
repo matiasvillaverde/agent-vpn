@@ -1,8 +1,9 @@
-//! Latency probing: exactly one timed HTTP request through a tunnel.
+//! Latency probing: timed HTTP requests through a tunnel.
 //!
-//! A probe brings the tunnel up if needed, issues a single `curl` request with
-//! a timing write-out, then restores the tunnel to its prior state. Probing
-//! every configured tunnel in sequence compares latency across VPN locations.
+//! A probe brings the tunnel up if needed, issues one or more timed `curl`
+//! requests (`--count N`), then restores the tunnel to its prior state.
+//! Probing every configured tunnel in sequence compares latency across VPN
+//! locations; multi-sample stats smooth out single-request jitter.
 
 use serde::Serialize;
 
@@ -26,6 +27,44 @@ pub struct Timings {
     pub total_ms: f64,
 }
 
+/// Aggregate statistics over a multi-sample probe (`--count N`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Stats {
+    /// Fastest total time across successful samples.
+    pub min_total_ms: f64,
+    /// Median total time across successful samples.
+    pub median_total_ms: f64,
+    /// Slowest total time across successful samples.
+    pub max_total_ms: f64,
+    /// Time-to-first-byte of the median sample.
+    pub median_ttfb_ms: f64,
+}
+
+/// Compute [`Stats`] over successful samples, returning the stats and the
+/// index of the median sample (by total time; upper-middle for even counts).
+/// Returns `None` for an empty slice.
+#[must_use]
+pub fn compute_stats(samples: &[Timings]) -> Option<(Stats, usize)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..samples.len()).collect();
+    order.sort_by(|&a, &b| {
+        samples[a]
+            .total_ms
+            .partial_cmp(&samples[b].total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let median_idx = order[order.len() / 2];
+    let stats = Stats {
+        min_total_ms: samples[order[0]].total_ms,
+        median_total_ms: samples[median_idx].total_ms,
+        max_total_ms: samples[order[order.len() - 1]].total_ms,
+        median_ttfb_ms: samples[median_idx].ttfb_ms,
+    };
+    Some((stats, median_idx))
+}
+
 /// The outcome of probing one tunnel.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ProbeResult {
@@ -33,23 +72,30 @@ pub struct ProbeResult {
     pub name: String,
     /// URL that was requested.
     pub url: String,
-    /// Whether the probe request completed.
+    /// Whether the probe completed (at least one sample succeeded).
     pub ok: bool,
     /// Whether the tunnel was brought up for this probe (and torn down after).
     pub activated: bool,
+    /// Number of requests attempted.
+    pub samples: u32,
+    /// Number of requests that failed.
+    pub failures: u32,
+    /// Aggregate timing statistics (present when any sample succeeded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<Stats>,
     /// Interface the tunnel ran on during the probe.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
-    /// HTTP status of the response.
+    /// HTTP status of the median sample's response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_code: Option<u16>,
-    /// Server IP the request actually connected to.
+    /// Server IP the median sample actually connected to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_ip: Option<String>,
-    /// Timing breakdown, when the request completed.
+    /// Timing breakdown of the median sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<Timings>,
-    /// Why the probe failed.
+    /// Why the probe failed (first failure message).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Non-fatal problem (e.g. the tunnel state could not be restored).
@@ -67,6 +113,9 @@ impl ProbeResult {
             url: url.to_string(),
             ok: false,
             activated,
+            samples: 0,
+            failures: 0,
+            stats: None,
             interface: None,
             http_code: None,
             remote_ip: None,
@@ -76,7 +125,7 @@ impl ProbeResult {
         }
     }
 
-    /// Total request time in ms, or `+inf` when the probe failed — so sorting
+    /// Median total time in ms, or `+inf` when the probe failed — so sorting
     /// by this value puts failures last.
     #[must_use]
     pub fn total_ms(&self) -> f64 {
@@ -158,5 +207,60 @@ mod tests {
         assert!(r.total_ms().is_infinite());
         assert!(!r.ok);
         assert!(r.activated);
+        assert_eq!(r.samples, 0);
+        assert_eq!(r.failures, 0);
+    }
+
+    fn t(total: f64, ttfb: f64) -> Timings {
+        Timings {
+            dns_ms: 1.0,
+            connect_ms: 2.0,
+            tls_ms: 3.0,
+            ttfb_ms: ttfb,
+            total_ms: total,
+        }
+    }
+
+    #[test]
+    fn compute_stats_empty_is_none() {
+        assert!(compute_stats(&[]).is_none());
+    }
+
+    #[test]
+    fn compute_stats_single_sample() {
+        let (stats, idx) = compute_stats(&[t(100.0, 90.0)]).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(stats.min_total_ms, 100.0);
+        assert_eq!(stats.median_total_ms, 100.0);
+        assert_eq!(stats.max_total_ms, 100.0);
+        assert_eq!(stats.median_ttfb_ms, 90.0);
+    }
+
+    #[test]
+    fn compute_stats_odd_count_picks_true_median() {
+        // Out of order on purpose: 300, 100, 200 -> median 200 at index 2.
+        let samples = [t(300.0, 290.0), t(100.0, 90.0), t(200.0, 190.0)];
+        let (stats, idx) = compute_stats(&samples).unwrap();
+        assert_eq!(idx, 2);
+        assert_eq!(stats.min_total_ms, 100.0);
+        assert_eq!(stats.median_total_ms, 200.0);
+        assert_eq!(stats.max_total_ms, 300.0);
+        assert_eq!(stats.median_ttfb_ms, 190.0);
+    }
+
+    #[test]
+    fn compute_stats_even_count_picks_upper_middle() {
+        let samples = [
+            t(100.0, 90.0),
+            t(400.0, 390.0),
+            t(200.0, 190.0),
+            t(300.0, 290.0),
+        ];
+        let (stats, idx) = compute_stats(&samples).unwrap();
+        // Sorted totals: 100,200,300,400 -> upper-middle 300 at index 3.
+        assert_eq!(idx, 3);
+        assert_eq!(stats.median_total_ms, 300.0);
+        assert_eq!(stats.min_total_ms, 100.0);
+        assert_eq!(stats.max_total_ms, 400.0);
     }
 }

@@ -172,15 +172,25 @@ fn status_line(status: &TunnelStatus) -> String {
 fn probe_line(r: &ProbeResult) -> String {
     let mut line = if r.ok {
         let t = r.timings.as_ref().expect("ok probes carry timings");
-        let mut line = format!(
-            "{:<14} total {:>8.1} ms   ttfb {:>8.1} ms",
-            r.name, t.total_ms, t.ttfb_ms
-        );
+        let mut line = match &r.stats {
+            // Multi-sample: lead with the median and show the spread.
+            Some(s) if r.samples > 1 => format!(
+                "{:<14} median {:>8.1} ms   (min {:.1}, max {:.1}, n={})   ttfb {:>8.1} ms",
+                r.name, s.median_total_ms, s.min_total_ms, s.max_total_ms, r.samples, t.ttfb_ms
+            ),
+            _ => format!(
+                "{:<14} total {:>8.1} ms   ttfb {:>8.1} ms",
+                r.name, t.total_ms, t.ttfb_ms
+            ),
+        };
         if let Some(code) = r.http_code {
             line.push_str(&format!("   http {code}"));
         }
         if let Some(ip) = &r.remote_ip {
             line.push_str(&format!("   via {ip}"));
+        }
+        if r.failures > 0 {
+            line.push_str(&format!("   ({}/{} failed)", r.failures, r.samples));
         }
         line
     } else {
@@ -388,6 +398,25 @@ mod tests {
         assert!(text.contains("broken"));
         assert!(text.contains("FAILED: curl: (7)"));
         assert!(text.contains("[warning: failed to restore"));
+    }
+
+    #[test]
+    fn human_probe_multisample_shows_median_and_spread() {
+        let mut r = ok_probe("proton", 291.0);
+        r.samples = 5;
+        r.failures = 1;
+        r.stats = Some(crate::probe::Stats {
+            min_total_ms: 250.0,
+            median_total_ms: 291.0,
+            max_total_ms: 400.0,
+            median_ttfb_ms: 290.0,
+        });
+        let text = render_report(&Report::Probe { results: vec![r] }, false);
+        assert!(text.contains("median"));
+        assert!(text.contains("min 250.0"));
+        assert!(text.contains("max 400.0"));
+        assert!(text.contains("n=5"));
+        assert!(text.contains("(1/5 failed)"));
     }
 
     #[test]

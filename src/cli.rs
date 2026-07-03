@@ -117,8 +117,8 @@ pub enum Command {
     },
     /// Print the names of currently-active tunnels.
     Current,
-    /// Send exactly one timed request through a tunnel (or each tunnel in
-    /// turn) and report latency; tunnel state is restored afterwards.
+    /// Send timed requests through a tunnel (or each tunnel in turn) and
+    /// report latency; tunnel state is restored afterwards.
     Probe {
         /// Tunnel name; omit to probe every tunnel sequentially and compare.
         name: Option<String>,
@@ -129,6 +129,9 @@ pub enum Command {
         /// Per-request timeout in seconds.
         #[arg(long, default_value_t = 10)]
         max_time: u64,
+        /// Requests per tunnel; medians over N samples smooth out jitter.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+        count: u32,
     },
 }
 
@@ -180,8 +183,9 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
             name,
             url,
             max_time,
+            count,
         } => Ok(Report::Probe {
-            results: backend.probe(name.as_deref(), url, *max_time)?,
+            results: backend.probe(name.as_deref(), url, *max_time, *count)?,
         }),
     }
 }
@@ -231,10 +235,12 @@ mod tests {
                 name,
                 url,
                 max_time,
+                count,
             } => {
                 assert_eq!(name, None);
                 assert_eq!(url, "https://1.1.1.1/cdn-cgi/trace");
                 assert_eq!(max_time, 10);
+                assert_eq!(count, 1);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -247,6 +253,8 @@ mod tests {
             "https://example.org",
             "--max-time",
             "5",
+            "--count",
+            "5",
         ])
         .unwrap();
         match cli.command {
@@ -254,13 +262,20 @@ mod tests {
                 name,
                 url,
                 max_time,
+                count,
             } => {
                 assert_eq!(name.as_deref(), Some("proton"));
                 assert_eq!(url, "https://example.org");
                 assert_eq!(max_time, 5);
+                assert_eq!(count, 5);
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_rejects_zero_count() {
+        assert!(Cli::try_parse_from(["vpn", "probe", "--count", "0"]).is_err());
     }
 
     #[test]
@@ -416,6 +431,7 @@ mod tests {
                 name: Some("home".into()),
                 url: "https://example.org".into(),
                 max_time: 10,
+                count: 1,
             },
         )
         .unwrap();
@@ -423,6 +439,8 @@ mod tests {
             Report::Probe { results } => {
                 assert_eq!(results.len(), 1);
                 assert!(results[0].ok);
+                assert_eq!(results[0].samples, 1);
+                assert_eq!(results[0].failures, 0);
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -191,20 +191,26 @@ impl<R: CommandRunner> Backend<R> {
     }
 
     /// Probe latency through one tunnel, or through every configured tunnel
-    /// when `name` is `None` (sequentially — one request per tunnel).
+    /// when `name` is `None` (sequentially — `count` requests per tunnel).
     ///
-    /// Results are sorted successes-first by total time. Per-tunnel failures
-    /// (backend refusal, request failure) are embedded in the results rather
-    /// than aborting the sweep; only environment-level errors (missing tunnel,
-    /// unspawnable `wg`) return `Err`.
-    pub fn probe(&self, name: Option<&str>, url: &str, max_time: u64) -> Result<Vec<ProbeResult>> {
+    /// Results are sorted successes-first by median total time. Per-tunnel
+    /// failures (backend refusal, request failure) are embedded in the results
+    /// rather than aborting the sweep; only environment-level errors (missing
+    /// tunnel, unspawnable `wg`) return `Err`.
+    pub fn probe(
+        &self,
+        name: Option<&str>,
+        url: &str,
+        max_time: u64,
+        count: u32,
+    ) -> Result<Vec<ProbeResult>> {
         let tunnels = match name {
             Some(n) => vec![config::resolve(&self.config_dir, n)?],
             None => config::discover(&self.config_dir)?,
         };
         let mut results = Vec::with_capacity(tunnels.len());
         for tunnel in &tunnels {
-            results.push(self.probe_one(tunnel, url, max_time)?);
+            results.push(self.probe_one(tunnel, url, max_time, count)?);
         }
         results.sort_by(|a, b| {
             b.ok.cmp(&a.ok)
@@ -218,9 +224,52 @@ impl<R: CommandRunner> Backend<R> {
         Ok(results)
     }
 
-    /// Send exactly one timed request through `tunnel`, restoring its previous
-    /// up/down state afterwards.
-    fn probe_one(&self, tunnel: &Tunnel, url: &str, max_time: u64) -> Result<ProbeResult> {
+    /// Send one timed request through `tunnel`.
+    ///
+    /// Returns the parsed sample on success, or a failure message. Runs
+    /// unprivileged: curl never goes through sudo.
+    fn probe_sample(
+        &self,
+        url: &str,
+        timeout: &str,
+    ) -> std::result::Result<(probe::Timings, Option<String>, Option<u16>), String> {
+        let curl_args: Vec<String> = [
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            probe::CURL_FORMAT,
+            "--max-time",
+            timeout,
+            url,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        match self.runner.run(&self.curl, &curl_args) {
+            Err(e) => Err(format!("failed to run '{}': {e}", self.curl)),
+            Ok(out) if !out.success() => {
+                let msg = out.stderr.trim();
+                Err(if msg.is_empty() {
+                    format!("{} exited {}", self.curl, out.code.unwrap_or(-1))
+                } else {
+                    msg.to_string()
+                })
+            }
+            Ok(out) => probe::parse_curl_output(out.stdout.trim())
+                .map_err(|msg| format!("unexpected curl output: {msg}")),
+        }
+    }
+
+    /// Send `count` timed requests through `tunnel` (bringing it up once if
+    /// needed), aggregate the samples, and restore the previous up/down state.
+    fn probe_one(
+        &self,
+        tunnel: &Tunnel,
+        url: &str,
+        max_time: u64,
+        count: u32,
+    ) -> Result<ProbeResult> {
         let dump = self.all_dump()?;
         let was_up = self.find_live(tunnel, &dump)?.is_some();
         let mut result = ProbeResult::new(&tunnel.name, url, !was_up);
@@ -241,40 +290,33 @@ impl<R: CommandRunner> Backend<R> {
             }
         }
 
-        // The request itself runs unprivileged: curl never goes through sudo.
         let timeout = max_time.to_string();
-        let curl_args: Vec<String> = [
-            "-sS",
-            "-o",
-            "/dev/null",
-            "-w",
-            probe::CURL_FORMAT,
-            "--max-time",
-            &timeout,
-            url,
-        ]
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-        match self.runner.run(&self.curl, &curl_args) {
-            Err(e) => result.error = Some(format!("failed to run '{}': {e}", self.curl)),
-            Ok(out) if !out.success() => {
-                let msg = out.stderr.trim();
-                result.error = Some(if msg.is_empty() {
-                    format!("{} exited {}", self.curl, out.code.unwrap_or(-1))
-                } else {
-                    msg.to_string()
-                });
-            }
-            Ok(out) => match probe::parse_curl_output(out.stdout.trim()) {
-                Ok((timings, remote_ip, http_code)) => {
-                    result.ok = true;
-                    result.timings = Some(timings);
-                    result.remote_ip = remote_ip;
-                    result.http_code = http_code;
+        let count = count.max(1);
+        let mut successes: Vec<(probe::Timings, Option<String>, Option<u16>)> = Vec::new();
+        let mut first_error: Option<String> = None;
+        for _ in 0..count {
+            match self.probe_sample(url, &timeout) {
+                Ok(sample) => successes.push(sample),
+                Err(msg) => {
+                    if first_error.is_none() {
+                        first_error = Some(msg);
+                    }
                 }
-                Err(msg) => result.error = Some(format!("unexpected curl output: {msg}")),
-            },
+            }
+        }
+        result.samples = count;
+        result.failures = count - u32::try_from(successes.len()).unwrap_or(0);
+        let timings: Vec<probe::Timings> = successes.iter().map(|s| s.0.clone()).collect();
+        if let Some((stats, median_idx)) = probe::compute_stats(&timings) {
+            let (timings, remote_ip, http_code) = successes.swap_remove(median_idx);
+            result.ok = true;
+            result.stats = Some(stats);
+            result.timings = Some(timings);
+            result.remote_ip = remote_ip;
+            result.http_code = http_code;
+        }
+        if result.failures > 0 {
+            result.error = first_error;
         }
 
         if !was_up {
@@ -627,7 +669,7 @@ mod tests {
         runner.ok(""); // wg-quick down (restore)
         let b = backend(runner.clone(), &cfg, true);
 
-        let results = b.probe(Some("home"), URL, 10).unwrap();
+        let results = b.probe(Some("home"), URL, 10, 1).unwrap();
         assert_eq!(results.len(), 1);
         let r = &results[0];
         assert!(r.ok);
@@ -657,7 +699,7 @@ mod tests {
         runner.ok(CURL_OK); // curl
         let b = backend(runner.clone(), &cfg, false);
 
-        let results = b.probe(Some("home"), URL, 10).unwrap();
+        let results = b.probe(Some("home"), URL, 10, 1).unwrap();
         assert!(results[0].ok);
         assert!(!results[0].activated);
         // No wg-quick calls at all: state untouched.
@@ -672,7 +714,7 @@ mod tests {
         runner.fail(1, "resolvconf missing"); // wg-quick up fails
         let b = backend(runner.clone(), &cfg, false);
 
-        let results = b.probe(Some("home"), URL, 10).unwrap();
+        let results = b.probe(Some("home"), URL, 10, 1).unwrap();
         let r = &results[0];
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap().contains("resolvconf"));
@@ -694,7 +736,7 @@ mod tests {
         runner.ok(""); // restore down
         let b = backend(runner.clone(), &cfg, false);
 
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap().contains("Failed to connect"));
         assert!(r.warning.is_none());
@@ -711,7 +753,7 @@ mod tests {
         runner.ok(ALL_DUMP); // info
         runner.fail(28, ""); // curl timeout, silent
         let b = backend(runner, &cfg, false);
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(r.error.as_deref().unwrap().contains("exited 28"));
     }
 
@@ -726,7 +768,7 @@ mod tests {
         runner.fail(1, "cannot remove utun"); // restore fails
         let b = backend(runner, &cfg, false);
 
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(r.ok, "probe data is still valid");
         assert!(r
             .warning
@@ -746,7 +788,7 @@ mod tests {
         runner.ok(""); // restore
         let b = backend(runner.clone(), &cfg, false);
 
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(!r.ok);
         assert!(r.error.as_deref().unwrap().contains("failed to run"));
         assert_eq!(runner.calls().last().unwrap().1[0], "down");
@@ -763,7 +805,7 @@ mod tests {
         runner.ok(""); // restore
         let b = backend(runner, &cfg, false);
 
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(r.ok, "probe succeeds without interface info");
         assert_eq!(r.interface, None);
     }
@@ -779,13 +821,75 @@ mod tests {
         runner.spawn_err(); // restore cannot even launch
         let b = backend(runner, &cfg, false);
 
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(r.ok);
         assert!(r
             .warning
             .as_deref()
             .unwrap()
             .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn probe_count_aggregates_samples_and_picks_median() {
+        const CURL_FAST: &str = "0.001,0.002,0.003,0.100,0.101,1.2.3.4,200";
+        const CURL_SLOW: &str = "0.001,0.002,0.003,0.200,0.300,5.6.7.8,200";
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_SLOW); // 300.0 ms
+        runner.ok(CURL_FAST); // 101.0 ms
+        runner.ok(CURL_OK); // 291.0 ms
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10, 3).unwrap()[0];
+        assert!(r.ok);
+        assert_eq!(r.samples, 3);
+        assert_eq!(r.failures, 0);
+        let s = r.stats.as_ref().unwrap();
+        assert_eq!(s.min_total_ms, 101.0);
+        assert_eq!(s.median_total_ms, 291.0);
+        assert_eq!(s.max_total_ms, 300.0);
+        // Reported point-in-time fields come from the median sample.
+        assert_eq!(r.timings.as_ref().unwrap().total_ms, 291.0);
+        assert_eq!(r.remote_ip.as_deref(), Some("104.16.132.229"));
+    }
+
+    #[test]
+    fn probe_count_tolerates_partial_failures() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK);
+        runner.fail(7, "curl: (7) mid-sample blip");
+        runner.ok(CURL_OK);
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10, 3).unwrap()[0];
+        assert!(r.ok, "one success is enough");
+        assert_eq!(r.samples, 3);
+        assert_eq!(r.failures, 1);
+        assert!(r.error.as_deref().unwrap().contains("mid-sample blip"));
+        assert!(r.stats.is_some());
+    }
+
+    #[test]
+    fn probe_count_all_failures_is_failed() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.fail(7, "first");
+        runner.fail(7, "second");
+        let b = backend(runner, &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10, 2).unwrap()[0];
+        assert!(!r.ok);
+        assert_eq!(r.failures, 2);
+        assert!(r.error.as_deref().unwrap().contains("first"));
+        assert!(r.stats.is_none());
     }
 
     #[test]
@@ -796,7 +900,7 @@ mod tests {
         runner.ok(ALL_DUMP); // info
         runner.ok("<html>captive portal</html>"); // nonsense
         let b = backend(runner, &cfg, false);
-        let r = &b.probe(Some("home"), URL, 10).unwrap()[0];
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
         assert!(!r.ok);
         assert!(r
             .error
@@ -824,7 +928,7 @@ mod tests {
         runner.ok(""); // restore
         let b = backend(runner, &cfg, false);
 
-        let results = b.probe(None, URL, 10).unwrap();
+        let results = b.probe(None, URL, 10, 1).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].ok && results[0].name == "home");
         assert!(!results[1].ok && results[1].name == "other");
@@ -834,7 +938,10 @@ mod tests {
     fn probe_missing_tunnel_is_a_hard_error() {
         let cfg = fixture();
         let b = backend(MockRunner::new(), &cfg, false);
-        assert_eq!(b.probe(Some("ghost"), URL, 10).unwrap_err().exit_code(), 3);
+        assert_eq!(
+            b.probe(Some("ghost"), URL, 10, 1).unwrap_err().exit_code(),
+            3
+        );
     }
 
     #[test]
@@ -845,7 +952,8 @@ mod tests {
         runner.ok(ALL_DUMP); // info
         runner.ok(CURL_OK); // curl
         let b = backend(runner.clone(), &cfg, false);
-        b.probe(Some("home"), "https://example.org/x", 42).unwrap();
+        b.probe(Some("home"), "https://example.org/x", 42, 1)
+            .unwrap();
 
         let curl_call = runner
             .calls()
