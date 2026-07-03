@@ -47,6 +47,21 @@ pub enum Error {
         path: PathBuf,
     },
 
+    /// An operation was refused to protect existing state or a broken config
+    /// (`--force` overrides where supported).
+    #[error("{0}")]
+    Refused(String),
+
+    /// Writing a file failed.
+    #[error("could not write '{path}': {source}")]
+    Write {
+        /// Path that could not be written.
+        path: PathBuf,
+        /// The underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+
     /// The backend command ran but exited non-zero.
     #[error("{program} failed (exit {code}): {stderr}")]
     Backend {
@@ -90,7 +105,9 @@ impl Error {
             Error::ConfigDir(..)
             | Error::ConfigParse { .. }
             | Error::TunnelConfRead { .. }
-            | Error::TunnelConfPeer { .. } => 1,
+            | Error::TunnelConfPeer { .. }
+            | Error::Refused(_)
+            | Error::Write { .. } => 1,
             Error::TunnelNotFound(_) => 3,
             Error::InvalidName(_) => 4,
             Error::Backend { .. } => 5,
@@ -158,6 +175,25 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(Error::Refused("nope".into()).exit_code(), 1);
+        assert_eq!(
+            Error::Write {
+                path: PathBuf::from("/x/t.conf"),
+                source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            Error::Refused("exact message".into()).to_string(),
+            "exact message"
+        );
+        assert!(Error::Write {
+            path: PathBuf::from("/dest/x.conf"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        }
+        .to_string()
+        .contains("/dest/x.conf"));
     }
 
     #[test]

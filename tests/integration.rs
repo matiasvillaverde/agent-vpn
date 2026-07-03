@@ -361,6 +361,58 @@ fn human_output_is_readable() {
 }
 
 #[test]
+fn add_then_split_workflow() {
+    let env = setup();
+    // A freshly "downloaded" Proton-style config with DNS + full tunnel.
+    let download = env.run_dir.path().join("vpn_cli-JP-77.conf");
+    fs::write(
+        &download,
+        "[Interface]\nPrivateKey = JPPRIV=\nAddress = 10.2.0.2/32\nDNS = 10.2.0.1\n\n\
+         [Peer]\nPublicKey = JPPEER=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 203.0.113.7:51820\n",
+    )
+    .unwrap();
+
+    // add: installs under the chosen name.
+    let (v, code) = env.json(&["add", download.to_str().unwrap(), "--name", "proton-jp"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["name"], "proton-jp");
+    assert_eq!(v["lint"]["ok"], true);
+
+    // split: generates a Tailscale-safe sibling that lints clean.
+    let (v, code) = env.json(&[
+        "split",
+        "proton-jp",
+        "--exclude",
+        "100.64.0.0/10",
+        "--output",
+        "proton-jp-ts",
+    ]);
+    assert_eq!(code, 0);
+    assert_eq!(v["name"], "proton-jp-ts");
+    // Entry count depends on the endpoint bit pattern: 203.0.113.7 sits in
+    // 128.0.0.0/1, whose /32 exclusion splits into 31 blocks (9 + 31 + ::/0).
+    assert_eq!(v["entries"], 41);
+
+    let (v, code) = env.json(&["lint", "proton-jp-ts"]);
+    assert_eq!(code, 0);
+    assert_eq!(v["results"][0]["ok"], true);
+
+    // Both are now discoverable tunnels.
+    let (v, _) = env.json(&["list"]);
+    let names: Vec<&str> = v["tunnels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"proton-jp") && names.contains(&"proton-jp-ts"));
+
+    // Re-adding without --force refuses.
+    let (_v, code) = env.json(&["add", download.to_str().unwrap(), "--name", "proton-jp"]);
+    assert_eq!(code, 1);
+}
+
+#[test]
 fn lint_flags_routing_loops_and_exits_1() {
     let env = setup();
     // A split tunnel whose AllowedIPs cover its own endpoint.

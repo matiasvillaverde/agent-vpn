@@ -10,6 +10,7 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
+use crate::cidr::{self, Cidr4};
 use crate::config::{self, Tunnel};
 use crate::error::{Error, Result};
 use crate::lint;
@@ -358,6 +359,193 @@ impl<R: CommandRunner> Backend<R> {
             })
             .collect()
     }
+
+    /// Validate and install a config file as `<name>.conf` (0600) in the
+    /// config directory.
+    ///
+    /// The name defaults to the source file's stem. Lint errors and an
+    /// existing destination both refuse unless `force`.
+    pub fn add(
+        &self,
+        source: &Path,
+        name: Option<&str>,
+        force: bool,
+    ) -> Result<(String, PathBuf, lint::LintResult)> {
+        let name = match name {
+            Some(n) => n.to_string(),
+            None => source
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        };
+        if !config::is_valid_name(&name) {
+            return Err(Error::InvalidName(name));
+        }
+        let summary = config::conf_summary(source)?;
+        let result = lint::lint(&name, &summary);
+        if !result.ok && !force {
+            let errors: Vec<&str> = result
+                .findings
+                .iter()
+                .filter(|f| f.severity == lint::Severity::Error)
+                .map(|f| f.message.as_str())
+                .collect();
+            return Err(Error::Refused(format!(
+                "refusing to add '{}' — fix these or pass --force: {}",
+                source.display(),
+                errors.join("; ")
+            )));
+        }
+        let dest = self.config_dir.join(format!("{name}.conf"));
+        if dest.exists() && !force {
+            return Err(Error::Refused(format!(
+                "'{}' already exists — pass --force to overwrite",
+                dest.display()
+            )));
+        }
+        let contents =
+            std::fs::read_to_string(source).map_err(|source_err| Error::TunnelConfRead {
+                path: source.to_path_buf(),
+                source: source_err,
+            })?;
+        write_private(&dest, &contents, &self.config_dir)?;
+        Ok((name, dest, result))
+    }
+
+    /// Generate a split-tunnel sibling of `name`: `AllowedIPs` covering all of
+    /// IPv4 except the `--exclude` CIDRs and — always — the server's own
+    /// endpoint `/32` (preventing the routing loop `wg-quick` does not guard
+    /// against outside exact default routes). IPv6 stays fully routed (`::/0`).
+    /// The `DNS` line is dropped unless `keep_dns`.
+    ///
+    /// Returns the new tunnel's name, path, and AllowedIPs entry count.
+    pub fn split(
+        &self,
+        name: &str,
+        excludes: &[String],
+        output: Option<&str>,
+        keep_dns: bool,
+        force: bool,
+    ) -> Result<(String, PathBuf, usize)> {
+        let tunnel = config::resolve(&self.config_dir, name)?;
+        let summary = config::conf_summary(&tunnel.path)?;
+        let endpoint = summary.endpoint.ok_or_else(|| {
+            Error::Refused("config has no Endpoint — cannot compute a safe split tunnel".into())
+        })?;
+        let host = endpoint
+            .rsplit_once(':')
+            .map_or(endpoint.as_str(), |(host, _)| host);
+        let endpoint_ip = cidr::parse_ip4(host).map_err(|_| {
+            Error::Refused(format!(
+                "Endpoint '{endpoint}' is not an IPv4 address — split requires an IPv4 endpoint"
+            ))
+        })?;
+
+        let mut holes = vec![Cidr4 {
+            base: endpoint_ip,
+            prefix: 32,
+        }];
+        for exclude in excludes {
+            holes.push(Cidr4::parse(exclude).map_err(|msg| {
+                Error::Refused(format!("--exclude {exclude}: {msg} (IPv4 CIDRs only)"))
+            })?);
+        }
+        let allowed = cidr::exclude_from_full(&holes);
+        let allowed_line = allowed
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+            + ", ::/0";
+        let entries = allowed.len() + 1;
+
+        let out_name = match output {
+            Some(o) => o.to_string(),
+            None => format!("{name}-split"),
+        };
+        if !config::is_valid_name(&out_name) {
+            return Err(Error::InvalidName(out_name));
+        }
+        let dest = self.config_dir.join(format!("{out_name}.conf"));
+        if dest.exists() && !force {
+            return Err(Error::Refused(format!(
+                "'{}' already exists — pass --force to overwrite",
+                dest.display()
+            )));
+        }
+
+        let text =
+            std::fs::read_to_string(&tunnel.path).map_err(|source| Error::TunnelConfRead {
+                path: tunnel.path.clone(),
+                source,
+            })?;
+        let rewritten = rewrite_split(&text, &allowed_line, keep_dns)
+            .ok_or_else(|| Error::Refused("config has no AllowedIPs line to rewrite".into()))?;
+        write_private(&dest, &rewritten, &self.config_dir)?;
+        Ok((out_name, dest, entries))
+    }
+}
+
+/// Rewrite a config's first-peer `AllowedIPs` to `allowed_line`, dropping
+/// `DNS` lines unless `keep_dns`. Returns `None` if no AllowedIPs line exists.
+fn rewrite_split(text: &str, allowed_line: &str, keep_dns: bool) -> Option<String> {
+    let mut out = Vec::new();
+    let mut in_first_peer = false;
+    let mut seen_peer = false;
+    let mut replaced = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') {
+            let is_peer = line.eq_ignore_ascii_case("[peer]");
+            in_first_peer = is_peer && !seen_peer;
+            seen_peer = seen_peer || is_peer;
+            out.push(raw.to_string());
+            continue;
+        }
+        let key = line
+            .split_once('=')
+            .map(|(k, _)| k.trim().to_ascii_lowercase());
+        match key.as_deref() {
+            Some("dns") if !keep_dns => continue, // drop DNS override
+            Some("allowedips") if in_first_peer => {
+                if !replaced {
+                    out.push(format!("AllowedIPs = {allowed_line}"));
+                    replaced = true;
+                }
+                // subsequent AllowedIPs lines in the peer are dropped
+            }
+            _ => out.push(raw.to_string()),
+        }
+    }
+    if !replaced {
+        return None;
+    }
+    let mut result = out.join("\n");
+    result.push('\n');
+    Some(result)
+}
+
+/// Write `contents` to `dest` with owner-only permissions, creating the
+/// config directory if needed.
+fn write_private(dest: &Path, contents: &str, config_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| Error::ConfigDir(config_dir.to_path_buf(), e))?;
+    std::fs::write(dest, contents).map_err(|source| Error::Write {
+        path: dest.to_path_buf(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| Error::Write {
+                path: dest.to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// The outcome of running a command through a tunnel via `vpn exec`.
@@ -1246,6 +1434,178 @@ mod tests {
         assert!(one[0].ok);
 
         assert_eq!(b.lint(Some("ghost")).unwrap_err().exit_code(), 3);
+    }
+
+    #[test]
+    fn add_installs_config_with_private_permissions() {
+        let cfg = tempdir().unwrap();
+        let src_dir = tempdir().unwrap();
+        let src = src_dir.path().join("vpn_cli-JP-77.conf");
+        fs::write(&src, CONF).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        let (name, dest, lint) = b.add(&src, Some("proton-jp"), false).unwrap();
+        assert_eq!(name, "proton-jp");
+        assert!(lint.ok);
+        assert_eq!(dest, cfg.path().join("proton-jp.conf"));
+        assert_eq!(fs::read_to_string(&dest).unwrap(), CONF);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn add_defaults_name_to_stem_and_validates() {
+        let cfg = tempdir().unwrap();
+        let src_dir = tempdir().unwrap();
+        let good = src_dir.path().join("jp.conf");
+        fs::write(&good, CONF).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert_eq!(b.add(&good, None, false).unwrap().0, "jp");
+
+        // A stem that is not a valid tunnel name needs --name.
+        let bad = src_dir.path().join("has space.conf");
+        fs::write(&bad, CONF).unwrap();
+        assert_eq!(b.add(&bad, None, false).unwrap_err().exit_code(), 4);
+    }
+
+    #[test]
+    fn add_refuses_lint_errors_and_overwrites_without_force() {
+        let cfg = tempdir().unwrap();
+        let src_dir = tempdir().unwrap();
+        let broken = src_dir.path().join("broken.conf");
+        fs::write(
+            &broken,
+            "[Interface]\nPrivateKey = P\n[Peer]\nPublicKey = K\n\
+             AllowedIPs = 64.0.0.0/3\nEndpoint = 79.127.160.216:51820\n",
+        )
+        .unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        let err = b.add(&broken, None, false).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("routing loop"));
+        // --force overrides the lint refusal.
+        assert!(b.add(&broken, None, true).is_ok());
+
+        // Existing destination refuses without force.
+        let good = src_dir.path().join("broken2.conf");
+        fs::write(&good, CONF).unwrap();
+        let err = b.add(&good, Some("broken"), false).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(b.add(&good, Some("broken"), true).is_ok());
+    }
+
+    #[test]
+    fn add_missing_source_errors() {
+        let cfg = tempdir().unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+        let err = b.add(Path::new("/nonexistent/x.conf"), Some("x"), false);
+        assert_eq!(err.unwrap_err().exit_code(), 1);
+    }
+
+    /// A realistic source conf for split: full tunnel with DNS and comments.
+    const SPLIT_SRC: &str = "[Interface]\n# Key for vpn cli\nPrivateKey = IFPRIV\n\
+        Address = 10.2.0.2/32\nDNS = 10.2.0.1\n\n[Peer]\n# US-MA#93\nPublicKey = PEERKEY\n\
+        AllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 79.127.160.216:51820\n\
+        PersistentKeepalive = 25\n";
+
+    #[test]
+    fn split_generates_safe_sibling() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("proton.conf"), SPLIT_SRC).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        let (name, dest, entries) = b
+            .split("proton", &["100.64.0.0/10".to_string()], None, false, false)
+            .unwrap();
+        assert_eq!(name, "proton-split");
+        // 38 v4 CIDRs (tailscale + endpoint holes) + ::/0.
+        assert_eq!(entries, 39);
+
+        let text = fs::read_to_string(&dest).unwrap();
+        assert!(!text.to_lowercase().contains("dns ="), "DNS dropped");
+        assert!(text.contains("PrivateKey = IFPRIV"), "keys carried over");
+        assert!(text.contains("PersistentKeepalive = 25"));
+        assert!(text.contains("::/0"));
+        assert!(!text.contains("0.0.0.0/0"), "full route replaced");
+
+        // The generated config must lint clean — no routing loop.
+        let summary = config::conf_summary(&dest).unwrap();
+        let result = lint::lint(&name, &summary);
+        assert!(result.ok, "generated split must be safe: {result:?}");
+    }
+
+    #[test]
+    fn split_keep_dns_and_custom_output() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("proton.conf"), SPLIT_SRC).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        let (name, dest, _) = b.split("proton", &[], Some("p-ts"), true, false).unwrap();
+        assert_eq!(name, "p-ts");
+        let text = fs::read_to_string(&dest).unwrap();
+        assert!(text.contains("DNS = 10.2.0.1"), "--keep-dns preserves DNS");
+    }
+
+    #[test]
+    fn split_refusals() {
+        let cfg = tempdir().unwrap();
+        fs::write(cfg.path().join("proton.conf"), SPLIT_SRC).unwrap();
+        // No endpoint.
+        fs::write(
+            cfg.path().join("noend.conf"),
+            "[Peer]\nPublicKey = K\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        assert!(b
+            .split("noend", &[], None, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("no Endpoint"));
+        // Bad exclude CIDR.
+        assert!(b
+            .split("proton", &["::/0".to_string()], None, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("IPv4 CIDRs only"));
+        // Default output name too long -> invalid.
+        fs::write(cfg.path().join("a-very-long-nm.conf"), SPLIT_SRC).unwrap();
+        assert_eq!(
+            b.split("a-very-long-nm", &[], None, false, false)
+                .unwrap_err()
+                .exit_code(),
+            4
+        );
+        // Overwrite protection.
+        b.split("proton", &[], None, false, false).unwrap();
+        assert!(b
+            .split("proton", &[], None, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("already exists"));
+        assert!(b.split("proton", &[], None, false, true).is_ok());
+    }
+
+    #[test]
+    fn rewrite_split_handles_multiple_allowedips_and_missing() {
+        let text =
+            "[Peer]\nAllowedIPs = 10.0.0.0/8\nAllowedIPs = 172.16.0.0/12\nEndpoint = 1.2.3.4:1\n";
+        let out = rewrite_split(text, "0.0.0.0/1, 128.0.0.0/1", true).unwrap();
+        assert_eq!(
+            out.matches("AllowedIPs").count(),
+            1,
+            "collapsed to one line"
+        );
+        assert!(out.contains("AllowedIPs = 0.0.0.0/1, 128.0.0.0/1"));
+        assert!(out.contains("Endpoint = 1.2.3.4:1"));
+
+        assert!(rewrite_split("[Peer]\nPublicKey = K\n", "x", false).is_none());
     }
 
     #[test]

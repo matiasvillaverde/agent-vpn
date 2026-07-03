@@ -150,6 +150,39 @@ pub enum Command {
         /// Tunnel name; omit to lint every config.
         name: Option<String>,
     },
+    /// Validate a WireGuard config file and install it into the config
+    /// directory with owner-only permissions.
+    Add {
+        /// Path to the downloaded `.conf` file.
+        path: PathBuf,
+        /// Tunnel name; defaults to the file's stem.
+        #[arg(long)]
+        name: Option<String>,
+        /// Overwrite an existing tunnel / ignore lint errors.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate a split-tunnel sibling config: route everything except the
+    /// --exclude CIDRs, always also excluding the server's own endpoint (the
+    /// routing-loop guard wg-quick lacks for non-default routes).
+    Split {
+        /// Source tunnel name.
+        name: String,
+        /// IPv4 CIDRs to keep OUT of the tunnel (e.g. Tailscale's
+        /// 100.64.0.0/10); repeatable.
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Output tunnel name; defaults to `<name>-split`.
+        #[arg(long)]
+        output: Option<String>,
+        /// Keep the DNS override (dropped by default so mesh-VPN DNS keeps
+        /// working alongside).
+        #[arg(long)]
+        keep_dns: bool,
+        /// Overwrite an existing output config.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// The default config directory, `$HOME/.config/vpn`.
@@ -216,6 +249,30 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         Command::Lint { name } => Ok(Report::Lint {
             results: backend.lint(name.as_deref())?,
         }),
+        Command::Add { path, name, force } => {
+            let (name, dest, lint) = backend.add(path, name.as_deref(), *force)?;
+            Ok(Report::Add {
+                name,
+                path: dest.display().to_string(),
+                lint,
+            })
+        }
+        Command::Split {
+            name,
+            exclude,
+            output,
+            keep_dns,
+            force,
+        } => {
+            let (out_name, dest, entries) =
+                backend.split(name, exclude, output.as_deref(), *keep_dns, *force)?;
+            Ok(Report::Split {
+                source: name.clone(),
+                name: out_name,
+                path: dest.display().to_string(),
+                entries,
+            })
+        }
     }
 }
 

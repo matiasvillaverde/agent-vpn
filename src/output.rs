@@ -69,6 +69,26 @@ pub enum Report {
         /// One entry per linted config.
         results: Vec<LintResult>,
     },
+    /// Result of `add`.
+    Add {
+        /// Installed tunnel name.
+        name: String,
+        /// Destination path.
+        path: String,
+        /// Lint outcome for the installed config.
+        lint: LintResult,
+    },
+    /// Result of `split`.
+    Split {
+        /// Source tunnel name.
+        source: String,
+        /// New tunnel name.
+        name: String,
+        /// Destination path.
+        path: String,
+        /// Number of AllowedIPs entries written.
+        entries: usize,
+    },
 }
 
 impl Report {
@@ -185,6 +205,22 @@ fn human_report(report: &Report) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        Report::Add { name, path, lint } => {
+            let mut out = format!("added {name} ({path})");
+            for finding in &lint.findings {
+                out.push_str(&format!("\n  note: {}", finding.message));
+            }
+            out
+        }
+        Report::Split {
+            source,
+            name,
+            path,
+            entries,
+        } => format!(
+            "{name}: split tunnel of {source} written to {path} \
+             ({entries} AllowedIPs entries, endpoint excluded)"
+        ),
     }
 }
 
