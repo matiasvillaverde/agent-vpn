@@ -186,7 +186,15 @@ fn probe_line(r: &ProbeResult) -> String {
         if let Some(code) = r.http_code {
             line.push_str(&format!("   http {code}"));
         }
-        if let Some(ip) = &r.remote_ip {
+        if let Some(exit) = &r.exit {
+            line.push_str(&format!("   exit {}", exit.ip));
+            match (&exit.loc, &exit.colo) {
+                (Some(loc), Some(colo)) => line.push_str(&format!(" ({loc}/{colo})")),
+                (Some(loc), None) => line.push_str(&format!(" ({loc})")),
+                (None, Some(colo)) => line.push_str(&format!(" ({colo})")),
+                (None, None) => {}
+            }
+        } else if let Some(ip) = &r.remote_ip {
             line.push_str(&format!("   via {ip}"));
         }
         if r.failures > 0 {
@@ -398,6 +406,47 @@ mod tests {
         assert!(text.contains("broken"));
         assert!(text.contains("FAILED: curl: (7)"));
         assert!(text.contains("[warning: failed to restore"));
+    }
+
+    #[test]
+    fn human_probe_shows_exit_evidence_over_remote_ip() {
+        let mut r = ok_probe("proton-jp", 291.0);
+        r.exit = Some(crate::probe::TraceInfo {
+            ip: "103.5.140.1".into(),
+            loc: Some("JP".into()),
+            colo: Some("NRT".into()),
+        });
+        let text = render_report(&Report::Probe { results: vec![r] }, false);
+        assert!(text.contains("exit 103.5.140.1 (JP/NRT)"));
+        assert!(!text.contains("via 104.16"), "exit evidence replaces via");
+
+        // Partial evidence renders gracefully.
+        let mut r = ok_probe("x", 1.0);
+        r.exit = Some(crate::probe::TraceInfo {
+            ip: "1.2.3.4".into(),
+            loc: None,
+            colo: Some("EWR".into()),
+        });
+        assert!(render_report(&Report::Probe { results: vec![r] }, false)
+            .contains("exit 1.2.3.4 (EWR)"));
+        let mut r = ok_probe("y", 1.0);
+        r.exit = Some(crate::probe::TraceInfo {
+            ip: "1.2.3.4".into(),
+            loc: Some("US".into()),
+            colo: None,
+        });
+        assert!(
+            render_report(&Report::Probe { results: vec![r] }, false).contains("exit 1.2.3.4 (US)")
+        );
+        let mut r = ok_probe("z", 1.0);
+        r.exit = Some(crate::probe::TraceInfo {
+            ip: "1.2.3.4".into(),
+            loc: None,
+            colo: None,
+        });
+        let text = render_report(&Report::Probe { results: vec![r] }, false);
+        assert!(text.contains("exit 1.2.3.4"));
+        assert!(!text.contains('('));
     }
 
     #[test]

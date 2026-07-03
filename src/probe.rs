@@ -11,6 +11,84 @@ use serde::Serialize;
 /// times in seconds).
 pub const CURL_FORMAT: &str = "%{time_namelookup},%{time_connect},%{time_appconnect},%{time_starttransfer},%{time_total},%{remote_ip},%{http_code}";
 
+/// Separator emitted between the (optional) response body and the write-out
+/// metadata, so both can travel over curl's stdout.
+pub const OUTPUT_MARKER: &str = "<<<VPNPROBE>>>";
+
+/// Exit-location evidence parsed from a `cdn-cgi/trace` response body.
+///
+/// `ip` is the address the edge saw the request come from — i.e. the VPN
+/// exit's public IP — and `colo`/`loc` identify the answering PoP and its
+/// country. Together they prove *where* the probe actually egressed.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TraceInfo {
+    /// Public IP the request appeared to come from (the tunnel exit).
+    pub ip: String,
+    /// Country code reported by the edge, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loc: Option<String>,
+    /// CDN point-of-presence that answered, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colo: Option<String>,
+}
+
+/// Parse a `cdn-cgi/trace`-style `key=value` body into [`TraceInfo`].
+///
+/// Returns `None` unless an `ip=` line is present — anything else is not
+/// usable exit evidence.
+#[must_use]
+pub fn parse_trace_body(body: &str) -> Option<TraceInfo> {
+    let mut ip = None;
+    let mut loc = None;
+    let mut colo = None;
+    for line in body.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            "ip" => ip = Some(value.to_string()),
+            "loc" => loc = Some(value.to_string()),
+            "colo" => colo = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    ip.map(|ip| TraceInfo { ip, loc, colo })
+}
+
+/// One fully parsed probe sample.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    /// Timing breakdown.
+    pub timings: Timings,
+    /// Server IP the request connected to.
+    pub remote_ip: Option<String>,
+    /// HTTP status of the response.
+    pub http_code: Option<u16>,
+    /// Exit-location evidence, when the response body was a trace.
+    pub trace: Option<TraceInfo>,
+}
+
+/// Parse curl's combined stdout: `[body]` + [`OUTPUT_MARKER`] + write-out
+/// metadata. A missing marker is tolerated (the whole output is treated as
+/// metadata) so plain write-out output still parses.
+pub fn parse_probe_output(stdout: &str) -> Result<Sample, String> {
+    let (body, meta) = match stdout.rfind(OUTPUT_MARKER) {
+        Some(pos) => (&stdout[..pos], &stdout[pos + OUTPUT_MARKER.len()..]),
+        None => ("", stdout),
+    };
+    let (timings, remote_ip, http_code) = parse_curl_output(meta.trim())?;
+    Ok(Sample {
+        timings,
+        remote_ip,
+        http_code,
+        trace: parse_trace_body(body),
+    })
+}
+
 /// Timing breakdown of a probe request, in milliseconds. All values are
 /// cumulative from the start of the request, matching curl's semantics.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -92,6 +170,10 @@ pub struct ProbeResult {
     /// Server IP the median sample actually connected to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_ip: Option<String>,
+    /// Exit-location evidence from the median sample (trace URLs only): the
+    /// tunnel's public exit IP and the answering PoP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<TraceInfo>,
     /// Timing breakdown of the median sample.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<Timings>,
@@ -119,6 +201,7 @@ impl ProbeResult {
             interface: None,
             http_code: None,
             remote_ip: None,
+            exit: None,
             timings: None,
             error: None,
             warning: None,
@@ -219,6 +302,58 @@ mod tests {
             ttfb_ms: ttfb,
             total_ms: total,
         }
+    }
+
+    #[test]
+    fn parse_trace_body_extracts_exit_evidence() {
+        let body =
+            "fl=123abc\nip=203.0.113.99\nts=1700000000\nloc=US\ncolo=EWR\nvisit_scheme=https\n";
+        let trace = parse_trace_body(body).unwrap();
+        assert_eq!(trace.ip, "203.0.113.99");
+        assert_eq!(trace.loc.as_deref(), Some("US"));
+        assert_eq!(trace.colo.as_deref(), Some("EWR"));
+    }
+
+    #[test]
+    fn parse_trace_body_requires_ip() {
+        assert!(parse_trace_body("loc=US\ncolo=EWR\n").is_none());
+        assert!(parse_trace_body("").is_none());
+        assert!(parse_trace_body("<html>not a trace</html>").is_none());
+        assert!(parse_trace_body("ip=\nloc=US\n").is_none());
+    }
+
+    #[test]
+    fn parse_probe_output_with_body_and_marker() {
+        let stdout = format!(
+            "ip=1.2.3.4\nloc=JP\ncolo=NRT\n{OUTPUT_MARKER}0.001,0.002,0.003,0.100,0.101,9.9.9.9,200"
+        );
+        let sample = parse_probe_output(&stdout).unwrap();
+        assert_eq!(sample.timings.total_ms, 101.0);
+        assert_eq!(sample.remote_ip.as_deref(), Some("9.9.9.9"));
+        assert_eq!(sample.http_code, Some(200));
+        let trace = sample.trace.unwrap();
+        assert_eq!(trace.ip, "1.2.3.4");
+        assert_eq!(trace.colo.as_deref(), Some("NRT"));
+    }
+
+    #[test]
+    fn parse_probe_output_without_marker_is_metadata_only() {
+        let sample = parse_probe_output("0.001,0.002,0.003,0.100,0.101,9.9.9.9,200").unwrap();
+        assert_eq!(sample.timings.total_ms, 101.0);
+        assert!(sample.trace.is_none());
+    }
+
+    #[test]
+    fn parse_probe_output_empty_body_has_no_trace() {
+        let stdout = format!("\n{OUTPUT_MARKER}0,0,0,0,0,,200");
+        let sample = parse_probe_output(&stdout).unwrap();
+        assert!(sample.trace.is_none());
+    }
+
+    #[test]
+    fn parse_probe_output_rejects_garbage_metadata() {
+        let stdout = format!("ip=1.2.3.4\n{OUTPUT_MARKER}<html>portal</html>");
+        assert!(parse_probe_output(&stdout).is_err());
     }
 
     #[test]

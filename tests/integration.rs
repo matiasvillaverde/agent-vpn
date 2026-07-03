@@ -62,12 +62,17 @@ printf 'unsupported wg invocation\n' 1>&2
 exit 1
 "#;
 
-/// Fake `curl`: emits a write-out line, or fails when the URL contains "fail".
+/// Fake `curl`: emits a trace body (for trace URLs) plus the marker-separated
+/// write-out, or fails when the URL contains "fail".
 const FAKE_CURL: &str = r#"#!/bin/sh
 for a; do url=$a; done
 case "$url" in
   *fail*) printf 'curl: (7) Failed to connect\n' 1>&2; exit 7 ;;
-  *) printf '0.004000,0.012000,0.140000,0.290000,0.291000,104.16.132.229,200' ;;
+  *cdn-cgi/trace*)
+    printf 'fl=x\nip=203.0.113.99\nloc=US\ncolo=EWR\n'
+    printf '\n<<<VPNPROBE>>>0.004000,0.012000,0.140000,0.290000,0.291000,104.16.132.229,200'
+    ;;
+  *) printf '\n<<<VPNPROBE>>>0.004000,0.012000,0.140000,0.290000,0.291000,104.16.132.229,200' ;;
 esac
 "#;
 
@@ -187,6 +192,10 @@ fn probe_activates_and_restores() {
     assert_eq!(r["remote_ip"], "104.16.132.229");
     assert_eq!(r["timings"]["total_ms"], 291.0);
     assert_eq!(r["timings"]["ttfb_ms"], 290.0);
+    // Exit-location evidence from the trace body.
+    assert_eq!(r["exit"]["ip"], "203.0.113.99");
+    assert_eq!(r["exit"]["loc"], "US");
+    assert_eq!(r["exit"]["colo"], "EWR");
 
     // The tunnel is back down afterwards.
     let (v, _) = env.json(&["status", "home"]);

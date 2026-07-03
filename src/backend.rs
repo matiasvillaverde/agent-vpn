@@ -228,17 +228,20 @@ impl<R: CommandRunner> Backend<R> {
     ///
     /// Returns the parsed sample on success, or a failure message. Runs
     /// unprivileged: curl never goes through sudo.
-    fn probe_sample(
-        &self,
-        url: &str,
-        timeout: &str,
-    ) -> std::result::Result<(probe::Timings, Option<String>, Option<u16>), String> {
+    ///
+    /// For trace URLs the small response body is captured (separated from the
+    /// write-out metadata by [`probe::OUTPUT_MARKER`]) so the exit IP and
+    /// answering PoP can be reported as evidence of where the probe egressed.
+    /// Other URLs discard the body — it could be arbitrarily large.
+    fn probe_sample(&self, url: &str, timeout: &str) -> std::result::Result<probe::Sample, String> {
+        let capture_body = url.contains("cdn-cgi/trace");
+        let write_out = format!("\n{}{}", probe::OUTPUT_MARKER, probe::CURL_FORMAT);
         let curl_args: Vec<String> = [
             "-sS",
             "-o",
-            "/dev/null",
+            if capture_body { "-" } else { "/dev/null" },
             "-w",
-            probe::CURL_FORMAT,
+            &write_out,
             "--max-time",
             timeout,
             url,
@@ -256,7 +259,7 @@ impl<R: CommandRunner> Backend<R> {
                     msg.to_string()
                 })
             }
-            Ok(out) => probe::parse_curl_output(out.stdout.trim())
+            Ok(out) => probe::parse_probe_output(&out.stdout)
                 .map_err(|msg| format!("unexpected curl output: {msg}")),
         }
     }
@@ -292,7 +295,7 @@ impl<R: CommandRunner> Backend<R> {
 
         let timeout = max_time.to_string();
         let count = count.max(1);
-        let mut successes: Vec<(probe::Timings, Option<String>, Option<u16>)> = Vec::new();
+        let mut successes: Vec<probe::Sample> = Vec::new();
         let mut first_error: Option<String> = None;
         for _ in 0..count {
             match self.probe_sample(url, &timeout) {
@@ -306,14 +309,15 @@ impl<R: CommandRunner> Backend<R> {
         }
         result.samples = count;
         result.failures = count - u32::try_from(successes.len()).unwrap_or(0);
-        let timings: Vec<probe::Timings> = successes.iter().map(|s| s.0.clone()).collect();
+        let timings: Vec<probe::Timings> = successes.iter().map(|s| s.timings.clone()).collect();
         if let Some((stats, median_idx)) = probe::compute_stats(&timings) {
-            let (timings, remote_ip, http_code) = successes.swap_remove(median_idx);
+            let median = successes.swap_remove(median_idx);
             result.ok = true;
             result.stats = Some(stats);
-            result.timings = Some(timings);
-            result.remote_ip = remote_ip;
-            result.http_code = http_code;
+            result.timings = Some(median.timings);
+            result.remote_ip = median.remote_ip;
+            result.http_code = median.http_code;
+            result.exit = median.trace;
         }
         if result.failures > 0 {
             result.error = first_error;
@@ -828,6 +832,59 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("failed to restore tunnel state"));
+    }
+
+    #[test]
+    fn probe_reports_exit_evidence_from_trace_body() {
+        const CURL_TRACE: &str = "ip=203.0.113.99\nloc=US\ncolo=EWR\n<<<VPNPROBE>>>0.004,0.012,0.140,0.290,0.291,104.16.132.229,200";
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_TRACE);
+        let b = backend(runner.clone(), &cfg, false);
+
+        let r = &b.probe(Some("home"), URL, 10, 1).unwrap()[0];
+        assert!(r.ok);
+        let exit = r.exit.as_ref().unwrap();
+        assert_eq!(exit.ip, "203.0.113.99");
+        assert_eq!(exit.loc.as_deref(), Some("US"));
+        assert_eq!(exit.colo.as_deref(), Some("EWR"));
+
+        // Trace URL: body is captured to stdout.
+        let curl_call = runner
+            .calls()
+            .into_iter()
+            .find(|(p, _)| p == "curl")
+            .unwrap();
+        let o_pos = curl_call.1.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(curl_call.1[o_pos + 1], "-");
+    }
+
+    #[test]
+    fn probe_discards_body_for_non_trace_urls() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // already up
+        runner.ok(ALL_DUMP); // info
+        runner.ok(CURL_OK);
+        let b = backend(runner.clone(), &cfg, false);
+
+        let r = &b
+            .probe(Some("home"), "https://example.org/big", 10, 1)
+            .unwrap()[0];
+        assert!(r.ok);
+        assert!(r.exit.is_none());
+
+        let curl_call = runner
+            .calls()
+            .into_iter()
+            .find(|(p, _)| p == "curl")
+            .unwrap();
+        let o_pos = curl_call.1.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(curl_call.1[o_pos + 1], "/dev/null");
+        // The write-out includes the marker so parsing stays uniform.
+        assert!(curl_call.1.iter().any(|a| a.contains("<<<VPNPROBE>>>")));
     }
 
     #[test]
