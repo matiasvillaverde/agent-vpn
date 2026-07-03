@@ -47,6 +47,10 @@ exit 0
 /// Fake `wg`: renders `show all dump` from the state files. Builtins only.
 const FAKE_WG: &str = r#"#!/bin/sh
 run="$FAKE_WG_RUN_DIR"
+if [ "$1" = "--version" ]; then
+  printf 'wireguard-tools v1.0-fake\n'
+  exit 0
+fi
 if [ "$1" = "show" ] && [ "$2" = "all" ] && [ "$3" = "dump" ]; then
   for f in "$run"/state-*; do
     [ -f "$f" ] || continue
@@ -438,6 +442,45 @@ fn lint_flags_routing_loops_and_exits_1() {
     let (v, code) = env.json(&["lint", "home"]);
     assert_eq!(code, 0);
     assert_eq!(v["results"][0]["ok"], true);
+}
+
+#[test]
+fn doctor_reports_environment() {
+    let env = setup();
+    // Make the fixture config private so it passes the permission check.
+    fs::set_permissions(
+        env.config_dir.path().join("home.conf"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let (v, code) = env.json(&["doctor"]);
+    assert_eq!(code, 0, "healthy env: {v}");
+    let checks = v["checks"].as_array().unwrap();
+    let names: Vec<&str> = checks.iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"wg"));
+    assert!(names.contains(&"wg-quick"));
+    assert!(names.contains(&"curl"));
+    assert!(names.contains(&"wg state"));
+    assert!(names.contains(&"config:home"));
+    assert!(checks.iter().all(|c| c["ok"] == true));
+
+    // Loosen permissions: doctor fails with a chmod hint.
+    fs::set_permissions(
+        env.config_dir.path().join("home.conf"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let (v, code) = env.json(&["doctor"]);
+    assert_eq!(code, 1);
+    let broken = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "config:home")
+        .unwrap();
+    assert_eq!(broken["ok"], false);
+    assert!(broken["detail"].as_str().unwrap().contains("chmod 600"));
 }
 
 #[test]

@@ -183,6 +183,10 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Diagnose the environment: binaries, passwordless sudo, WireGuard
+    /// state access, and config validity/permissions. Exits 1 if anything
+    /// fails, with a fix hint per check.
+    Doctor,
 }
 
 /// The default config directory, `$HOME/.config/vpn`.
@@ -273,6 +277,9 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
                 entries,
             })
         }
+        Command::Doctor => Ok(Report::Doctor {
+            checks: backend.doctor(),
+        }),
     }
 }
 

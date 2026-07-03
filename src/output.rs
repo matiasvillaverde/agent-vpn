@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::backend::Check;
 use crate::error::Error;
 use crate::lint::{LintResult, Severity};
 use crate::probe::ProbeResult;
@@ -89,6 +90,11 @@ pub enum Report {
         /// Number of AllowedIPs entries written.
         entries: usize,
     },
+    /// Result of `doctor`.
+    Doctor {
+        /// One entry per environment check.
+        checks: Vec<Check>,
+    },
 }
 
 impl Report {
@@ -103,6 +109,7 @@ impl Report {
             Report::Probe { results } if results.iter().any(|r| !r.ok) => 7,
             Report::Exec { exit_code, .. } => *exit_code,
             Report::Lint { results } if results.iter().any(|r| !r.ok) => 1,
+            Report::Doctor { checks } if checks.iter().any(|c| !c.ok) => 1,
             _ => 0,
         }
     }
@@ -221,6 +228,18 @@ fn human_report(report: &Report) -> String {
             "{name}: split tunnel of {source} written to {path} \
              ({entries} AllowedIPs entries, endpoint excluded)"
         ),
+        Report::Doctor { checks } => checks
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {:<14} {}",
+                    if c.ok { "ok  " } else { "FAIL" },
+                    c.name,
+                    c.detail
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 

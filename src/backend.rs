@@ -487,6 +487,173 @@ impl<R: CommandRunner> Backend<R> {
     }
 }
 
+/// One environment check performed by `vpn doctor`.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct Check {
+    /// What was checked.
+    pub name: String,
+    /// Whether the check passed.
+    pub ok: bool,
+    /// Human-readable outcome or fix hint.
+    pub detail: String,
+}
+
+fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
+    Check {
+        name: name.to_string(),
+        ok,
+        detail: detail.into(),
+    }
+}
+
+impl<R: CommandRunner> Backend<R> {
+    /// Diagnose the environment: are the backend binaries reachable, does
+    /// passwordless sudo work, can WireGuard state be read, and are the
+    /// configs valid and private? Failures are embedded in the checks (never
+    /// an `Err`) so an agent can read the full picture and fix its own setup.
+    pub fn doctor(&self) -> Vec<Check> {
+        let mut checks = Vec::new();
+
+        // Binaries reachable (unprivileged).
+        checks.push(self.check_version("wg", &self.wg));
+        checks.push(match self.runner.run(&self.wg_quick, &[]) {
+            // wg-quick with no args prints usage and exits non-zero: found.
+            Ok(_) => check("wg-quick", true, format!("found ({})", self.wg_quick)),
+            Err(e) => check(
+                "wg-quick",
+                false,
+                format!(
+                    "cannot run '{}': {e} — install wireguard-tools",
+                    self.wg_quick
+                ),
+            ),
+        });
+        checks.push(self.check_version("curl", &self.curl));
+
+        // Passwordless sudo, when configured.
+        if self.sudo {
+            let args: Vec<String> = ["-n", &self.wg, "--version"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            checks.push(match self.runner.run("sudo", &args) {
+                Ok(out) if out.success() => check("sudo", true, "passwordless sudo works"),
+                Ok(out) => check(
+                    "sudo",
+                    false,
+                    format!(
+                        "sudo -n failed: {} — add a NOPASSWD rule for {} and {}",
+                        out.stderr.trim(),
+                        self.wg_quick,
+                        self.wg
+                    ),
+                ),
+                Err(e) => check("sudo", false, format!("cannot run sudo: {e}")),
+            });
+        }
+
+        // Live WireGuard state readable end-to-end.
+        checks.push(match self.all_dump() {
+            Ok(dump) => {
+                let interfaces: std::collections::BTreeSet<&str> =
+                    dump.iter().map(|d| d.interface.as_str()).collect();
+                check(
+                    "wg state",
+                    true,
+                    format!("readable ({} live interface(s))", interfaces.len()),
+                )
+            }
+            Err(e) => check("wg state", false, e.to_string()),
+        });
+
+        // Configs discoverable, lint-clean, and private.
+        match config::discover(&self.config_dir) {
+            Err(e) => checks.push(check("config dir", false, e.to_string())),
+            Ok(tunnels) => {
+                checks.push(check(
+                    "config dir",
+                    true,
+                    format!(
+                        "{} tunnel(s) in {}",
+                        tunnels.len(),
+                        self.config_dir.display()
+                    ),
+                ));
+                for tunnel in &tunnels {
+                    checks.push(self.check_tunnel(tunnel));
+                }
+            }
+        }
+        checks
+    }
+
+    /// Probe a binary via `--version`, unprivileged.
+    fn check_version(&self, label: &str, program: &str) -> Check {
+        match self.runner.run(program, &["--version".to_string()]) {
+            Ok(out) if out.success() => {
+                let version = out.stdout.lines().next().unwrap_or("found").trim();
+                check(label, true, version)
+            }
+            Ok(out) => check(
+                label,
+                false,
+                format!("'{program} --version' exited {}", out.code.unwrap_or(-1)),
+            ),
+            Err(e) => check(label, false, format!("cannot run '{program}': {e}")),
+        }
+    }
+
+    /// Lint one config and verify its permissions are owner-only.
+    fn check_tunnel(&self, tunnel: &Tunnel) -> Check {
+        let name = format!("config:{}", tunnel.name);
+        let result = match config::conf_summary(&tunnel.path) {
+            Ok(summary) => lint::lint(&tunnel.name, &summary),
+            Err(e) => return check(&name, false, e.to_string()),
+        };
+        if !result.ok {
+            let errors: Vec<&str> = result
+                .findings
+                .iter()
+                .filter(|f| f.severity == lint::Severity::Error)
+                .map(|f| f.message.as_str())
+                .collect();
+            return check(&name, false, errors.join("; "));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&tunnel.path) {
+                let mode = meta.permissions().mode() & 0o077;
+                if mode != 0 {
+                    return check(
+                        &name,
+                        false,
+                        format!(
+                            "private key readable by others (mode {:03o}) — chmod 600 '{}'",
+                            meta.permissions().mode() & 0o777,
+                            tunnel.path.display()
+                        ),
+                    );
+                }
+            }
+        }
+        let note = if result.findings.is_empty() {
+            "ok".to_string()
+        } else {
+            format!(
+                "ok ({})",
+                result
+                    .findings
+                    .iter()
+                    .map(|f| f.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
+        check(&name, true, note)
+    }
+}
+
 /// Rewrite a config's first-peer `AllowedIPs` to `allowed_line`, dropping
 /// `DNS` lines unless `keep_dns`. Returns `None` if no AllowedIPs line exists.
 fn rewrite_split(text: &str, allowed_line: &str, keep_dns: bool) -> Option<String> {
@@ -1590,6 +1757,107 @@ mod tests {
             .to_string()
             .contains("already exists"));
         assert!(b.split("proton", &[], None, false, true).is_ok());
+    }
+
+    #[test]
+    fn doctor_all_healthy() {
+        let cfg = fixture();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                cfg.path().join("home.conf"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let runner = MockRunner::new();
+        runner.ok("wireguard-tools v1.0.20260223\n"); // wg --version
+        runner.fail(1, "Usage: wg-quick"); // wg-quick (usage exit is fine)
+        runner.ok("curl 8.7.1\n"); // curl --version
+        runner.ok(ALL_DUMP); // wg show all dump
+        let b = backend(runner, &cfg, false);
+
+        let checks = b.doctor();
+        assert!(checks.iter().all(|c| c.ok), "all healthy: {checks:?}");
+        let names: Vec<&str> = checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "wg",
+                "wg-quick",
+                "curl",
+                "wg state",
+                "config dir",
+                "config:home"
+            ]
+        );
+        assert!(checks[0].detail.contains("wireguard-tools"));
+        assert!(checks[3].detail.contains("1 live interface"));
+    }
+
+    #[test]
+    fn doctor_reports_missing_binaries_and_sudo() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.spawn_err(); // wg missing
+        runner.spawn_err(); // wg-quick missing
+        runner.ok("curl 8.7.1\n"); // curl fine
+        runner.fail(1, "sudo: a password is required"); // sudo -n fails
+        runner.fail(1, "denied"); // all_dump via sudo fails
+        let b = backend(runner.clone(), &cfg, true);
+
+        let checks = b.doctor();
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        assert!(!by_name("wg").ok);
+        assert!(!by_name("wg-quick").ok);
+        assert!(by_name("wg-quick").detail.contains("wireguard-tools"));
+        assert!(by_name("curl").ok);
+        assert!(!by_name("sudo").ok);
+        assert!(by_name("sudo").detail.contains("NOPASSWD"));
+        assert!(!by_name("wg state").ok);
+        assert!(by_name("config dir").ok);
+        // sudo check went through `sudo -n`.
+        assert!(runner
+            .calls()
+            .iter()
+            .any(|(p, a)| p == "sudo" && a[0] == "-n"));
+    }
+
+    #[test]
+    fn doctor_flags_broken_configs_and_loose_permissions() {
+        let cfg = fixture();
+        fs::write(
+            cfg.path().join("loop.conf"),
+            "[Interface]\nPrivateKey = P\n[Peer]\nPublicKey = K\n\
+             AllowedIPs = 64.0.0.0/3\nEndpoint = 79.127.160.216:51820\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                cfg.path().join("home.conf"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        let runner = MockRunner::new();
+        runner.ok("wg v1\n");
+        runner.fail(1, "usage");
+        runner.ok("curl 8\n");
+        runner.ok(ALL_DUMP);
+        let b = backend(runner, &cfg, false);
+
+        let checks = b.doctor();
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        #[cfg(unix)]
+        {
+            assert!(!by_name("config:home").ok);
+            assert!(by_name("config:home").detail.contains("chmod 600"));
+        }
+        assert!(!by_name("config:loop").ok);
+        assert!(by_name("config:loop").detail.contains("routing loop"));
     }
 
     #[test]
