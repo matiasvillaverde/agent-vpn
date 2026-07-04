@@ -161,6 +161,11 @@ pub enum Command {
         /// Overwrite an existing tunnel / ignore lint errors.
         #[arg(long)]
         force: bool,
+        /// Install even though the config has PreUp/PostUp/PreDown/PostDown
+        /// shell hooks, which wg-quick runs as root. Only for configs you
+        /// fully trust; --force alone will NOT bypass the hook check.
+        #[arg(long)]
+        allow_hooks: bool,
     },
     /// Generate a split-tunnel sibling config: route everything except the
     /// --exclude CIDRs, always also excluding the server's own endpoint (the
@@ -258,8 +263,13 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         Command::Lint { name } => Ok(Report::Lint {
             results: backend.lint(name.as_deref())?,
         }),
-        Command::Add { path, name, force } => {
-            let (name, dest, lint) = backend.add(path, name.as_deref(), *force)?;
+        Command::Add {
+            path,
+            name,
+            force,
+            allow_hooks,
+        } => {
+            let (name, dest, lint) = backend.add(path, name.as_deref(), *force, *allow_hooks)?;
             Ok(Report::Add {
                 name,
                 path: dest.display().to_string(),

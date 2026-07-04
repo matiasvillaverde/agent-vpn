@@ -167,6 +167,16 @@ your-user ALL=(root) NOPASSWD: /opt/homebrew/bin/wg-quick, /opt/homebrew/bin/wg
 After that, the agent's entire vocabulary is `vpn probe`, `vpn up <name>`,
 `vpn status`, `vpn down <name>` — flag-free and prompt-free.
 
+> **Security — why config hooks are gated.** `wg-quick` executes any
+> `PreUp`/`PostUp`/`PreDown`/`PostDown` line in a config **as root** (via
+> `eval`). Because configs live in a user-writable directory, that combined
+> with the NOPASSWD rule above would let any process running as your user
+> escalate to root by writing a hook into a `.conf` and bringing it up. So
+> `vpn add` **refuses** configs containing these hooks (even under `--force`),
+> `vpn lint` flags them as errors, `vpn doctor` reports any already installed,
+> and `vpn split` strips them from generated siblings. If you genuinely need a
+> hook and fully trust the file, install it with `vpn add … --allow-hooks`.
+
 Settings resolve as: **CLI flag / env → `config.toml` → built-in default**.
 
 ### Options

@@ -69,6 +69,19 @@ pub fn lint(name: &str, summary: &ConfSummary) -> LintResult {
             }
         }
     }
+    if !summary.exec_hooks.is_empty() {
+        let mut hooks = summary.exec_hooks.clone();
+        hooks.dedup();
+        findings.push(Finding {
+            severity: Severity::Error,
+            message: format!(
+                "config contains shell hook(s) ({}) that wg-quick runs as root — \
+                 in a user-writable config this is a privilege-escalation vector; \
+                 remove them, or pass --allow-hooks if you fully trust this file",
+                hooks.join(", ")
+            ),
+        });
+    }
     findings.sort_by_key(|f| match f.severity {
         Severity::Error => 0,
         Severity::Warning => 1,
@@ -123,6 +136,7 @@ mod tests {
             endpoint: Some("79.127.160.216:51820".to_string()),
             has_dns: false,
             dns_servers: Vec::new(),
+            exec_hooks: Vec::new(),
         }
     }
 
@@ -222,6 +236,19 @@ mod tests {
             ..good_summary()
         };
         assert!(lint("odd", &summary).ok);
+    }
+
+    #[test]
+    fn exec_hooks_are_a_security_error() {
+        let summary = ConfSummary {
+            exec_hooks: vec!["PostUp".to_string(), "PostDown".to_string()],
+            ..good_summary()
+        };
+        let result = lint("hooked", &summary);
+        assert!(!result.ok, "hooks make the config unsafe");
+        let msg = &result.findings[0].message;
+        assert!(msg.contains("PostUp") && msg.contains("PostDown"));
+        assert!(msg.contains("root"));
     }
 
     #[test]

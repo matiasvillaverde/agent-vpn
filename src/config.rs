@@ -156,6 +156,11 @@ pub struct ConfSummary {
     pub has_dns: bool,
     /// The `[Interface]` `DNS` servers (trimmed, in declaration order).
     pub dns_servers: Vec<String>,
+    /// Any `wg-quick` shell hooks found (`PreUp`/`PostUp`/`PreDown`/`PostDown`),
+    /// by canonical key name, in order of appearance. `wg-quick` runs these as
+    /// root via `eval`, so in a user-writable config they are a privilege-
+    /// escalation vector — see [`crate::lint`].
+    pub exec_hooks: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +201,12 @@ pub fn conf_summary(path: &Path) -> Result<ConfSummary> {
         };
         let key = key.trim();
         let value = value.trim();
+        // Shell hooks are recognized by wg-quick anywhere in the file and run
+        // as root; detect them regardless of section so nothing can hide one.
+        if let Some(canonical) = exec_hook_name(key) {
+            summary.exec_hooks.push(canonical.to_string());
+            continue;
+        }
         match section {
             Section::Interface => {
                 if key.eq_ignore_ascii_case("privatekey") && !value.is_empty() {
@@ -225,6 +236,13 @@ pub fn conf_summary(path: &Path) -> Result<ConfSummary> {
         }
     }
     Ok(summary)
+}
+
+/// The canonical name of a `wg-quick` shell hook key, or `None` if `key` is
+/// not a hook. `wg-quick` runs these snippets as root via `eval`.
+pub fn exec_hook_name(key: &str) -> Option<&'static str> {
+    const HOOKS: [&str; 4] = ["PreUp", "PostUp", "PreDown", "PostDown"];
+    HOOKS.into_iter().find(|h| key.eq_ignore_ascii_case(h))
 }
 
 /// Resolve a single named tunnel to its config file.
@@ -453,6 +471,30 @@ mod tests {
         assert_eq!(s.peer_public_key.as_deref(), Some("PEER="));
         assert_eq!(s.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
         assert_eq!(s.endpoint.as_deref(), Some("1.2.3.4:51820"));
+    }
+
+    #[test]
+    fn conf_summary_detects_shell_hooks_anywhere_case_insensitively() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(
+            dir.path(),
+            "t",
+            "[Interface]\nPrivateKey = P\npostup = evil\nPreDown = x\n\n\
+             [Peer]\nPublicKey = K\nPostUp = also\nEndpoint = 1.2.3.4:5\n",
+        );
+        let s = conf_summary(&path).unwrap();
+        assert_eq!(s.exec_hooks, vec!["PostUp", "PreDown", "PostUp"]);
+    }
+
+    #[test]
+    fn conf_summary_clean_config_has_no_hooks() {
+        let dir = tempdir().unwrap();
+        let path = write_conf(
+            dir.path(),
+            "t",
+            "[Interface]\nPrivateKey = P\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = K\n",
+        );
+        assert!(conf_summary(&path).unwrap().exec_hooks.is_empty());
     }
 
     #[test]

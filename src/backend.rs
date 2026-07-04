@@ -416,6 +416,7 @@ impl<R: CommandRunner> Backend<R> {
         source: &Path,
         name: Option<&str>,
         force: bool,
+        allow_hooks: bool,
     ) -> Result<(String, PathBuf, lint::LintResult)> {
         let name = match name {
             Some(n) => n.to_string(),
@@ -429,9 +430,31 @@ impl<R: CommandRunner> Backend<R> {
             return Err(Error::InvalidName(name));
         }
         let summary = config::conf_summary(source)?;
+        // Security gate: shell hooks run as root and are refused even under
+        // --force. Only the explicit --allow-hooks opt-in installs them, so a
+        // blanket --force can never smuggle a privilege-escalation vector in.
+        if !summary.exec_hooks.is_empty() && !allow_hooks {
+            let mut hooks = summary.exec_hooks.clone();
+            hooks.dedup();
+            return Err(Error::Refused(format!(
+                "refusing to add '{}' — it contains shell hook(s) ({}) that wg-quick \
+                 runs as root; this is a privilege-escalation risk. Remove them, or pass \
+                 --allow-hooks if you fully trust this file (--force will NOT bypass this)",
+                source.display(),
+                hooks.join(", ")
+            )));
+        }
         let result = lint::lint(&name, &summary);
-        if !result.ok && !force {
-            let errors: Vec<&str> = result
+        // The --force gate covers ordinary lint errors. Hook errors are
+        // excluded here — they are governed solely by the --allow-hooks gate
+        // above — so evaluate a hook-free view for this check.
+        let force_view = config::ConfSummary {
+            exec_hooks: Vec::new(),
+            ..summary.clone()
+        };
+        let force_result = lint::lint(&name, &force_view);
+        if !force_result.ok && !force {
+            let errors: Vec<&str> = force_result
                 .findings
                 .iter()
                 .filter(|f| f.severity == lint::Severity::Error)
@@ -766,7 +789,10 @@ impl<R: CommandRunner> Backend<R> {
 }
 
 /// Rewrite a config's first-peer `AllowedIPs` to `allowed_line`, dropping
-/// `DNS` lines unless `keep_dns`. Returns `None` if no AllowedIPs line exists.
+/// `DNS` lines unless `keep_dns`. Shell hooks are always dropped: the sibling
+/// is written directly (bypassing `add`'s hook gate), so carrying a
+/// root-executed hook forward would silently propagate a privilege-escalation
+/// vector. Returns `None` if no AllowedIPs line exists.
 fn rewrite_split(text: &str, allowed_line: &str, keep_dns: bool) -> Option<String> {
     let mut out = Vec::new();
     let mut in_first_peer = false;
@@ -784,6 +810,11 @@ fn rewrite_split(text: &str, allowed_line: &str, keep_dns: bool) -> Option<Strin
         let key = line
             .split_once('=')
             .map(|(k, _)| k.trim().to_ascii_lowercase());
+        if let Some((k, _)) = line.split_once('=') {
+            if config::exec_hook_name(k.trim()).is_some() {
+                continue; // never propagate a root-executed hook
+            }
+        }
         match key.as_deref() {
             Some("dns") if !keep_dns => continue, // drop DNS override
             Some("allowedips") if in_first_peer => {
@@ -1821,7 +1852,7 @@ mod tests {
         fs::write(&src, CONF).unwrap();
         let b = backend(MockRunner::new(), &cfg, false);
 
-        let (name, dest, lint) = b.add(&src, Some("proton-jp"), false).unwrap();
+        let (name, dest, lint) = b.add(&src, Some("proton-jp"), false, false).unwrap();
         assert_eq!(name, "proton-jp");
         assert!(lint.ok);
         assert_eq!(dest, cfg.path().join("proton-jp.conf"));
@@ -1841,12 +1872,12 @@ mod tests {
         let good = src_dir.path().join("jp.conf");
         fs::write(&good, CONF).unwrap();
         let b = backend(MockRunner::new(), &cfg, false);
-        assert_eq!(b.add(&good, None, false).unwrap().0, "jp");
+        assert_eq!(b.add(&good, None, false, false).unwrap().0, "jp");
 
         // A stem that is not a valid tunnel name needs --name.
         let bad = src_dir.path().join("has space.conf");
         fs::write(&bad, CONF).unwrap();
-        assert_eq!(b.add(&bad, None, false).unwrap_err().exit_code(), 4);
+        assert_eq!(b.add(&bad, None, false, false).unwrap_err().exit_code(), 4);
     }
 
     #[test]
@@ -1862,25 +1893,91 @@ mod tests {
         .unwrap();
         let b = backend(MockRunner::new(), &cfg, false);
 
-        let err = b.add(&broken, None, false).unwrap_err();
+        let err = b.add(&broken, None, false, false).unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("routing loop"));
         // --force overrides the lint refusal.
-        assert!(b.add(&broken, None, true).is_ok());
+        assert!(b.add(&broken, None, true, false).is_ok());
 
         // Existing destination refuses without force.
         let good = src_dir.path().join("broken2.conf");
         fs::write(&good, CONF).unwrap();
-        let err = b.add(&good, Some("broken"), false).unwrap_err();
+        let err = b.add(&good, Some("broken"), false, false).unwrap_err();
         assert!(err.to_string().contains("already exists"));
-        assert!(b.add(&good, Some("broken"), true).is_ok());
+        assert!(b.add(&good, Some("broken"), true, false).is_ok());
+    }
+
+    /// A config carrying a root-executed shell hook (the escalation vector).
+    const CONF_HOOKED: &str = "[Interface]\nPrivateKey = IFPRIV\nAddress = 10.0.0.2/32\n\
+        PostUp = /bin/sh -c 'id > /tmp/pwned'\n\n\
+        [Peer]\nPublicKey = PEERKEY\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 203.0.113.1:51820\n";
+
+    #[test]
+    fn add_refuses_shell_hooks_even_under_force() {
+        let cfg = tempdir().unwrap();
+        let src_dir = tempdir().unwrap();
+        let src = src_dir.path().join("evil.conf");
+        fs::write(&src, CONF_HOOKED).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+
+        // Default: refused.
+        let err = b.add(&src, Some("evil"), false, false).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("PostUp"));
+        assert!(err.to_string().contains("root"));
+        // --force must NOT bypass the security gate.
+        let err = b.add(&src, Some("evil"), true, false).unwrap_err();
+        assert!(err.to_string().contains("--allow-hooks"));
+        assert!(
+            !cfg.path().join("evil.conf").exists(),
+            "hooked config must never be installed without --allow-hooks"
+        );
+        // The explicit opt-in installs it.
+        assert!(b.add(&src, Some("evil"), false, true).is_ok());
+        assert!(cfg.path().join("evil.conf").exists());
+    }
+
+    #[test]
+    fn split_strips_shell_hooks_from_the_sibling() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("hooked.conf"), CONF_HOOKED).unwrap();
+        let b = backend(MockRunner::new(), &cfg, false);
+        let (_, dest, _) = b
+            .split("hooked", &["100.64.0.0/10".to_string()], None, false, false)
+            .unwrap();
+        let text = fs::read_to_string(&dest).unwrap();
+        assert!(
+            !text.to_lowercase().contains("postup"),
+            "the split sibling must not carry a root-executed hook forward"
+        );
+        // And the generated sibling passes its own hook gate on re-add.
+        assert!(config::conf_summary(&dest).unwrap().exec_hooks.is_empty());
+    }
+
+    #[test]
+    fn doctor_flags_installed_hooked_config() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_HOOKED).unwrap();
+        let runner = MockRunner::new();
+        runner.ok("wireguard-tools v1.0");
+        runner.ok("usage");
+        runner.ok("curl 8.0");
+        runner.ok(""); // wg state
+        let b = backend(runner, &cfg, false);
+        let cfg_check = b
+            .doctor()
+            .into_iter()
+            .find(|c| c.name == "config:home")
+            .unwrap();
+        assert!(!cfg_check.ok);
+        assert!(cfg_check.detail.contains("PostUp"));
     }
 
     #[test]
     fn add_missing_source_errors() {
         let cfg = tempdir().unwrap();
         let b = backend(MockRunner::new(), &cfg, false);
-        let err = b.add(Path::new("/nonexistent/x.conf"), Some("x"), false);
+        let err = b.add(Path::new("/nonexistent/x.conf"), Some("x"), false, false);
         assert_eq!(err.unwrap_err().exit_code(), 1);
     }
 
