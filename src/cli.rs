@@ -219,10 +219,15 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
                 status,
             })
         }
-        Command::Down { name } => Ok(Report::Down {
-            name: name.clone(),
-            changed: backend.down(name)?,
-        }),
+        Command::Down { name } => {
+            let outcome = backend.down(name)?;
+            Ok(Report::Down {
+                name: name.clone(),
+                changed: outcome.changed,
+                dns_cleared: outcome.dns_cleared,
+                dns_warning: outcome.dns_warning,
+            })
+        }
         Command::Status { name } => {
             let tunnels = match name {
                 Some(n) => vec![backend.status_one(n)?],

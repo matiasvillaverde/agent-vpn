@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cidr::{self, Cidr4};
 use crate::config::{self, Tunnel};
+use crate::dns;
 use crate::error::{Error, Result};
 use crate::lint;
 use crate::probe::{self, ProbeResult};
@@ -26,6 +27,7 @@ pub struct Backend<R: CommandRunner> {
     wg: String,
     wg_quick: String,
     curl: String,
+    dns_sweeps: Vec<u64>,
 }
 
 impl<R: CommandRunner> Backend<R> {
@@ -43,7 +45,16 @@ impl<R: CommandRunner> Backend<R> {
             wg: "wg".to_string(),
             wg_quick: "wg-quick".to_string(),
             curl: "curl".to_string(),
+            dns_sweeps: dns::SWEEP_DELAYS_MS.to_vec(),
         }
+    }
+
+    /// Override the DNS-guard sweep schedule (delays in ms before each
+    /// verification sweep after a teardown). Tests use all-zero schedules.
+    #[must_use]
+    pub fn with_dns_sweeps(mut self, sweep_delays_ms: Vec<u64>) -> Self {
+        self.dns_sweeps = sweep_delays_ms;
+        self
     }
 
     /// Override the `wg`, `wg-quick` and `curl` program paths (absolute paths
@@ -176,20 +187,53 @@ impl<R: CommandRunner> Backend<R> {
         Ok((true, self.status_one(name)?))
     }
 
-    /// Bring a tunnel down. Returns `changed`, which is `false` if it was
-    /// already down.
-    pub fn down(&self, name: &str) -> Result<bool> {
+    /// Bring a tunnel down, then run the DNS guard: any network service left
+    /// pinned to the tunnel's own `DNS` servers (a broken state — that
+    /// resolver is unreachable without the tunnel) is reset to DHCP.
+    ///
+    /// The guard also runs when the tunnel was already down, so `vpn down` is
+    /// an explicit repair action for DNS poisoned by an unclean teardown
+    /// (crash, shutdown with the tunnel up).
+    pub fn down(&self, name: &str) -> Result<DownOutcome> {
         let tunnel = config::resolve(&self.config_dir, name)?;
         let dump = self.all_dump()?;
-        if self.find_live(&tunnel, &dump)?.is_none() {
-            return Ok(false);
+        let changed = match self.find_live(&tunnel, &dump)? {
+            None => false,
+            Some(_) => {
+                let path = tunnel.path.to_string_lossy().into_owned();
+                let out = self.exec(&self.wg_quick, &["down", &path])?;
+                if !out.success() {
+                    return Err(backend_error(&self.wg_quick, &out));
+                }
+                true
+            }
+        };
+        let guard = self.dns_guard(&tunnel);
+        Ok(DownOutcome {
+            changed,
+            dns_cleared: guard.cleared,
+            dns_warning: guard.warning,
+        })
+    }
+
+    /// Run the DNS guard for a tunnel that was just brought (or found) down.
+    ///
+    /// Skipped when the config declares no `DNS`, or when any configured
+    /// tunnel is still up — in that case the system DNS is legitimately owned
+    /// by the live tunnel's `wg-quick` session. Never fails: guard problems
+    /// are embedded in the outcome.
+    fn dns_guard(&self, tunnel: &Tunnel) -> dns::GuardOutcome {
+        let Ok(summary) = config::conf_summary(&tunnel.path) else {
+            return dns::GuardOutcome::default();
+        };
+        if summary.dns_servers.is_empty() {
+            return dns::GuardOutcome::default();
         }
-        let path = tunnel.path.to_string_lossy().into_owned();
-        let out = self.exec(&self.wg_quick, &["down", &path])?;
-        if !out.success() {
-            return Err(backend_error(&self.wg_quick, &out));
+        // Conservative on errors: if liveness is unknown, do not touch DNS.
+        if self.current().map_or(true, |active| !active.is_empty()) {
+            return dns::GuardOutcome::default();
         }
-        Ok(true)
+        dns::guard(&self.runner, &summary.dns_servers, &self.dns_sweeps)
     }
 
     /// Probe latency through one tunnel, or through every configured tunnel
@@ -327,7 +371,9 @@ impl<R: CommandRunner> Backend<R> {
 
         if !was_up {
             match self.exec(&self.wg_quick, &["down", &path]) {
-                Ok(out) if out.success() => {}
+                Ok(out) if out.success() => {
+                    result.warning = self.dns_guard(tunnel).note();
+                }
                 Ok(out) => {
                     result.warning = Some(format!(
                         "failed to restore tunnel state: {}",
@@ -487,6 +533,17 @@ impl<R: CommandRunner> Backend<R> {
     }
 }
 
+/// The outcome of `vpn down`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DownOutcome {
+    /// `true` if this call changed state (was up, now down).
+    pub changed: bool,
+    /// Network services whose stale VPN DNS the guard cleared (reset to DHCP).
+    pub dns_cleared: Vec<String>,
+    /// Non-fatal DNS-guard problem (stale DNS seen but not cleanly cleared).
+    pub dns_warning: Option<String>,
+}
+
 /// One environment check performed by `vpn doctor`.
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct Check {
@@ -584,7 +641,61 @@ impl<R: CommandRunner> Backend<R> {
                 }
             }
         }
+        if let Some(dns_check) = self.check_dns() {
+            checks.push(dns_check);
+        }
         checks
+    }
+
+    /// Flag network services pinned to any config's `DNS` servers while no
+    /// tunnel is up. In that state the pinned resolver is unreachable, so
+    /// name resolution is dead machine-wide until the setting is cleared —
+    /// the residue of an unclean `wg-quick` teardown.
+    ///
+    /// `None` when not applicable: no config declares `DNS`, `networksetup`
+    /// is unavailable (not macOS), or liveness cannot be determined (the
+    /// `wg state` check already reports that failure).
+    fn check_dns(&self) -> Option<Check> {
+        let tunnels = config::discover(&self.config_dir).unwrap_or_default();
+        let mut declared: Vec<String> = Vec::new();
+        for tunnel in &tunnels {
+            if let Ok(summary) = config::conf_summary(&tunnel.path) {
+                for server in summary.dns_servers {
+                    if !declared.contains(&server) {
+                        declared.push(server);
+                    }
+                }
+            }
+        }
+        if declared.is_empty() {
+            return None;
+        }
+        match self.current() {
+            Err(_) => None,
+            Ok(active) if !active.is_empty() => Some(check(
+                "dns",
+                true,
+                format!("VPN DNS active while up (owned by {})", active.join(", ")),
+            )),
+            Ok(_) => match dns::stale_services(&self.runner, &declared) {
+                None => None,
+                Some(stale) if stale.is_empty() => Some(check(
+                    "dns",
+                    true,
+                    "no stale VPN DNS on any network service",
+                )),
+                Some(stale) => Some(check(
+                    "dns",
+                    false,
+                    format!(
+                        "stale VPN DNS pinned on {} — name resolution is broken while \
+                         tunnels are down; run 'vpn down <name>' to repair, or: \
+                         networksetup -setdnsservers '<service>' Empty",
+                        stale.join(", ")
+                    ),
+                )),
+            },
+        }
     }
 
     /// Probe a binary via `--version`, unprivileged.
@@ -754,7 +865,9 @@ impl<R: CommandRunner> Backend<R> {
         let mut warning = None;
         if !was_up {
             match self.exec(&self.wg_quick, &["down", &path]) {
-                Ok(out) if out.success() => {}
+                Ok(out) if out.success() => {
+                    warning = self.dns_guard(&tunnel).note();
+                }
                 Ok(out) => {
                     warning = Some(format!(
                         "failed to restore tunnel state: {}",
@@ -845,7 +958,7 @@ mod tests {
     }
 
     fn backend(runner: MockRunner, cfg: &TempDir, sudo: bool) -> Backend<MockRunner> {
-        Backend::new(runner, cfg.path().to_path_buf(), sudo)
+        Backend::new(runner, cfg.path().to_path_buf(), sudo).with_dns_sweeps(vec![0, 0])
     }
 
     #[test]
@@ -968,7 +1081,7 @@ mod tests {
         runner.ok(""); // wg-quick down
         let b = backend(runner.clone(), &cfg, false);
 
-        assert!(b.down("home").unwrap());
+        assert!(b.down("home").unwrap().changed);
         let calls = runner.calls();
         assert_eq!(calls[1].0, "wg-quick");
         assert_eq!(calls[1].1[0], "down");
@@ -980,8 +1093,80 @@ mod tests {
         let runner = MockRunner::new();
         runner.ok(""); // nothing live
         let b = backend(runner.clone(), &cfg, false);
-        assert!(!b.down("home").unwrap());
+        assert!(!b.down("home").unwrap().changed);
         assert_eq!(runner.calls().len(), 1);
+    }
+
+    /// `CONF` plus a `DNS` line, as VPN-provider configs ship it.
+    const CONF_DNS: &str = "[Interface]\nPrivateKey = IFPRIV\nAddress = 10.0.0.2/32\n\
+        DNS = 10.2.0.1, 2a07:b944::2:1\n\n\
+        [Peer]\nPublicKey = PEERKEY\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 203.0.113.1:51820\n";
+
+    const SERVICES: &str = "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n";
+    const NO_DNS_SET: &str = "There aren't any DNS Servers set on Wi-Fi.";
+
+    #[test]
+    fn down_repairs_poisoned_dns() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // live
+        runner.ok(""); // wg-quick down
+        runner.ok(""); // guard: current() dump — nothing up
+        runner.ok(SERVICES); // sweep 1
+        runner.ok("10.2.0.1"); // Wi-Fi still pinned to the tunnel's DNS
+        runner.ok(""); // reset to Empty
+        runner.ok(SERVICES); // sweep 2
+        runner.ok(NO_DNS_SET); // clean
+        let b = backend(runner.clone(), &cfg, false);
+
+        let outcome = b.down("home").unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.dns_cleared, vec!["Wi-Fi".to_string()]);
+        assert!(outcome.dns_warning.is_none());
+        let reset = &runner.calls()[5];
+        assert_eq!(reset.0, "networksetup");
+        assert_eq!(reset.1, vec!["-setdnsservers", "Wi-Fi", "Empty"]);
+    }
+
+    #[test]
+    fn down_when_already_down_still_repairs_dns() {
+        // The poisoned state outlives the tunnel (crash, shutdown while up):
+        // `vpn down` must repair DNS even with nothing to tear down.
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(""); // nothing live
+        runner.ok(""); // guard: current() dump — nothing up
+        runner.ok(SERVICES);
+        runner.ok("2a07:b944::2:1"); // pinned via the IPv6 resolver
+        runner.ok(""); // reset
+        runner.ok(SERVICES);
+        runner.ok(NO_DNS_SET);
+        let b = backend(runner, &cfg, false);
+
+        let outcome = b.down("home").unwrap();
+        assert!(!outcome.changed);
+        assert_eq!(outcome.dns_cleared, vec!["Wi-Fi".to_string()]);
+    }
+
+    #[test]
+    fn down_guard_skipped_while_another_tunnel_is_up() {
+        // A live tunnel legitimately owns the system DNS; never touch it.
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        fs::write(cfg.path().join("other.conf"), CONF_OTHER).unwrap();
+        let other_dump = "utun9\tIFPRIV\tIFPUB\t51820\toff\n\
+            utun9\tOTHERKEY\t(none)\t203.0.113.9:51820\t0.0.0.0/0\t1700000000\t1\t2\t25\n";
+        let runner = MockRunner::new();
+        runner.ok(other_dump); // home not live
+        runner.ok(other_dump); // guard: current() — other is up
+        let b = backend(runner.clone(), &cfg, false);
+
+        let outcome = b.down("home").unwrap();
+        assert!(!outcome.changed);
+        assert!(outcome.dns_cleared.is_empty());
+        assert!(runner.calls().iter().all(|(p, _)| p != "networksetup"));
     }
 
     #[test]
@@ -1493,6 +1678,31 @@ mod tests {
     }
 
     #[test]
+    fn exec_restore_repairs_stale_dns_and_reports_it() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down
+        runner.ok(""); // wg-quick up
+        runner.ok(""); // child exits 0
+        runner.ok(""); // wg-quick down
+        runner.ok(""); // guard: current() dump — nothing up
+        runner.ok(SERVICES);
+        runner.ok("10.2.0.1"); // poisoned
+        runner.ok(""); // reset
+        runner.ok(SERVICES);
+        runner.ok(NO_DNS_SET);
+        let b = backend(runner, &cfg, false);
+
+        let outcome = b.exec_through("home", &cmd(&["true"])).unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.warning.as_deref(),
+            Some("cleared stale VPN DNS from Wi-Fi")
+        );
+    }
+
+    #[test]
     fn exec_on_running_tunnel_leaves_it_up() {
         let cfg = fixture();
         let runner = MockRunner::new();
@@ -1794,6 +2004,50 @@ mod tests {
         );
         assert!(checks[0].detail.contains("wireguard-tools"));
         assert!(checks[3].detail.contains("1 live interface"));
+    }
+
+    #[test]
+    fn doctor_flags_stale_dns_when_no_tunnel_up() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok("wireguard-tools v1.0"); // wg --version
+        runner.ok("usage"); // wg-quick
+        runner.ok("curl 8.0"); // curl --version
+        runner.ok(""); // wg state dump — nothing up
+        runner.ok(""); // check_dns: current() dump
+        runner.ok(SERVICES);
+        runner.ok("10.2.0.1"); // Wi-Fi pinned, nothing up: broken
+        let b = backend(runner, &cfg, false);
+
+        let dns = b.doctor().into_iter().find(|c| c.name == "dns").unwrap();
+        assert!(!dns.ok);
+        assert!(dns.detail.contains("Wi-Fi"));
+        assert!(dns.detail.contains("vpn down"));
+    }
+
+    #[test]
+    fn doctor_dns_ok_while_a_tunnel_is_up() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok("wireguard-tools v1.0");
+        runner.ok("usage");
+        runner.ok("curl 8.0");
+        runner.ok(ALL_DUMP); // wg state dump — home is up
+        runner.ok(ALL_DUMP); // check_dns: current() dump
+        let b = backend(runner, &cfg, false);
+
+        let dns = b.doctor().into_iter().find(|c| c.name == "dns").unwrap();
+        assert!(dns.ok);
+        assert!(dns.detail.contains("home"));
+    }
+
+    #[test]
+    fn doctor_has_no_dns_check_without_dns_configs() {
+        let cfg = fixture(); // CONF declares no DNS
+        let b = backend(MockRunner::new(), &cfg, false);
+        assert!(b.doctor().iter().all(|c| c.name != "dns"));
     }
 
     #[test]

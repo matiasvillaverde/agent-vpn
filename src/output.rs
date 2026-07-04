@@ -36,6 +36,14 @@ pub enum Report {
         name: String,
         /// `true` if this call changed state (was up, now down).
         changed: bool,
+        /// Network services whose stale VPN DNS was cleared (reset to DHCP)
+        /// after the teardown.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dns_cleared: Vec<String>,
+        /// Non-fatal DNS-guard problem (stale DNS seen but not cleanly
+        /// cleared).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dns_warning: Option<String>,
     },
     /// Result of `status`.
     Status {
@@ -163,13 +171,28 @@ fn human_report(report: &Report) -> String {
             let verb = if *changed { "brought up" } else { "already up" };
             format!("{name}: {verb} ({})", status_line(status))
         }
-        Report::Down { name, changed } => {
+        Report::Down {
+            name,
+            changed,
+            dns_cleared,
+            dns_warning,
+        } => {
             let verb = if *changed {
                 "brought down"
             } else {
                 "already down"
             };
-            format!("{name}: {verb}")
+            let mut text = format!("{name}: {verb}");
+            if !dns_cleared.is_empty() {
+                text.push_str(&format!(
+                    " (cleared stale VPN DNS from {})",
+                    dns_cleared.join(", ")
+                ));
+            }
+            if let Some(warning) = dns_warning {
+                text.push_str(&format!("\nwarning: {warning}"));
+            }
+            text
         }
         Report::Status { tunnels } => {
             if tunnels.is_empty() {
@@ -422,6 +445,8 @@ mod tests {
             &Report::Down {
                 name: "home".into(),
                 changed: true,
+                dns_cleared: Vec::new(),
+                dns_warning: None,
             },
             false,
         )
@@ -430,10 +455,51 @@ mod tests {
             &Report::Down {
                 name: "home".into(),
                 changed: false,
+                dns_cleared: Vec::new(),
+                dns_warning: None,
             },
             false,
         )
         .contains("already down"));
+    }
+
+    #[test]
+    fn human_down_reports_dns_repair() {
+        let text = render_report(
+            &Report::Down {
+                name: "proton".into(),
+                changed: true,
+                dns_cleared: vec!["Wi-Fi".into(), "Thunderbolt Bridge".into()],
+                dns_warning: Some("could not reset DNS on 'iPhone USB'".into()),
+            },
+            false,
+        );
+        assert!(text.contains("cleared stale VPN DNS from Wi-Fi, Thunderbolt Bridge"));
+        assert!(text.contains("warning: could not reset DNS on 'iPhone USB'"));
+    }
+
+    #[test]
+    fn json_down_omits_empty_dns_fields() {
+        let clean = render_report(
+            &Report::Down {
+                name: "proton".into(),
+                changed: true,
+                dns_cleared: Vec::new(),
+                dns_warning: None,
+            },
+            true,
+        );
+        assert!(!clean.contains("dns_cleared") && !clean.contains("dns_warning"));
+        let repaired = render_report(
+            &Report::Down {
+                name: "proton".into(),
+                changed: false,
+                dns_cleared: vec!["Wi-Fi".into()],
+                dns_warning: None,
+            },
+            true,
+        );
+        assert!(repaired.contains("\"dns_cleared\""));
     }
 
     #[test]

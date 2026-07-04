@@ -83,6 +83,17 @@ becomes vpn's exit code.
 - **macOS-correct** — live tunnels are detected by matching each config's peer
   key and allowed-IPs against one `wg show all dump`, so `status` / `down` /
   `current` work even though `wg-quick`'s interface-name file is root-only.
+- **DNS self-healing (macOS)** — on macOS, `wg-quick` remembers your original
+  DNS only in the memory of a background process; if that process dies without
+  restoring it (shutdown or crash with a tunnel up, rapid up/down cycles), the
+  tunnel's VPN-internal resolver stays pinned on every network service and the
+  machine has no working DNS whenever tunnels are down — and every later `up`
+  snapshots the broken value as the "original", perpetuating it. After each
+  teardown, `vpn down` (and the restore step of `probe`/`exec`) detects
+  services still pinned to the tunnel's own `DNS` servers and resets them to
+  DHCP, re-checking on a short schedule to outlast `wg-quick`'s asynchronous
+  restore. Running `vpn down` on an already-down tunnel repairs the state
+  explicitly, and `vpn doctor` flags it (check `dns`) with a fix hint.
 
 ## Install
 

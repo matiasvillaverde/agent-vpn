@@ -11,6 +11,7 @@ pub mod backend;
 pub mod cidr;
 pub mod cli;
 pub mod config;
+pub mod dns;
 pub mod error;
 pub mod lint;
 pub mod lock;

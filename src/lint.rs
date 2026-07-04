@@ -122,6 +122,7 @@ mod tests {
             allowed_ips: vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
             endpoint: Some("79.127.160.216:51820".to_string()),
             has_dns: false,
+            dns_servers: Vec::new(),
         }
     }
 

@@ -154,6 +154,8 @@ pub struct ConfSummary {
     pub endpoint: Option<String>,
     /// Whether `[Interface]` sets `DNS`.
     pub has_dns: bool,
+    /// The `[Interface]` `DNS` servers (trimmed, in declaration order).
+    pub dns_servers: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +202,12 @@ pub fn conf_summary(path: &Path) -> Result<ConfSummary> {
                     summary.has_private_key = true;
                 } else if key.eq_ignore_ascii_case("dns") {
                     summary.has_dns = true;
+                    summary.dns_servers.extend(
+                        value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty()),
+                    );
                 }
             }
             Section::FirstPeer => {
@@ -435,12 +443,13 @@ mod tests {
         let path = write_conf(
             dir.path(),
             "t",
-            "[Interface]\nPrivateKey = PRIV=\nAddress = 10.0.0.2/32\nDNS = 10.2.0.1\n\n\
+            "[Interface]\nPrivateKey = PRIV=\nAddress = 10.0.0.2/32\nDNS = 10.2.0.1, 2a07:b944::2:1\n\n\
              [Peer]\nPublicKey = PEER=\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n",
         );
         let s = conf_summary(&path).unwrap();
         assert!(s.has_private_key);
         assert!(s.has_dns);
+        assert_eq!(s.dns_servers, vec!["10.2.0.1", "2a07:b944::2:1"]);
         assert_eq!(s.peer_public_key.as_deref(), Some("PEER="));
         assert_eq!(s.allowed_ips, vec!["0.0.0.0/0", "::/0"]);
         assert_eq!(s.endpoint.as_deref(), Some("1.2.3.4:51820"));
