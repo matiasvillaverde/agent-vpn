@@ -107,6 +107,23 @@ pub enum Report {
     Recover {
         /// Tunnels/interfaces restored (empty when nothing needed fixing).
         recovered: Vec<crate::backend::Recovered>,
+        /// Host health *after* recovery — proves the repair worked, or lists
+        /// what it could not fix.
+        health: crate::backend::HealthReport,
+    },
+    /// Result of `verify`.
+    Verify {
+        /// Host-health assessment.
+        health: crate::backend::HealthReport,
+    },
+    /// Result of `diff`.
+    Diff {
+        /// URL that was fetched.
+        url: String,
+        /// One entry per location.
+        results: Vec<crate::diff::LocationResult>,
+        /// Fields (status/headers) that differ across locations.
+        diffs: Vec<crate::diff::FieldDiff>,
     },
 }
 
@@ -123,6 +140,10 @@ impl Report {
             Report::Exec { exit_code, .. } => *exit_code,
             Report::Lint { results } if results.iter().any(|r| !r.ok) => 1,
             Report::Doctor { checks } if checks.iter().any(|c| !c.ok) => 1,
+            Report::Verify { health } if !health.healthy => 8,
+            // Recovery ran but the host is still inconsistent: signal it.
+            Report::Recover { health, .. } if !health.healthy => 8,
+            Report::Diff { results, .. } if results.iter().any(|r| !r.ok) => 7,
             _ => 0,
         }
     }
@@ -268,24 +289,97 @@ fn human_report(report: &Report) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        Report::Recover { recovered } => {
-            if recovered.is_empty() {
-                return "nothing to recover — host state is clean".to_string();
+        Report::Diff {
+            url,
+            results,
+            diffs,
+        } => {
+            let mut lines = vec![format!(
+                "diff of {url} across {} location(s):",
+                results.len()
+            )];
+            for r in results {
+                if r.ok {
+                    lines.push(format!(
+                        "  {:<14} {} ({} headers)",
+                        r.name,
+                        r.status.map_or("?".to_string(), |s| s.to_string()),
+                        r.headers.len()
+                    ));
+                } else {
+                    lines.push(format!(
+                        "  {:<14} FAILED: {}",
+                        r.name,
+                        r.error.as_deref().unwrap_or("unknown error")
+                    ));
+                }
             }
-            recovered
-                .iter()
-                .map(|r| {
-                    let mut line = format!("recovered {} ({})", r.tunnel, r.reason);
-                    if !r.dns_cleared.is_empty() {
-                        line.push_str(&format!("; restored DNS on {}", r.dns_cleared.join(", ")));
+            let ok_count = results.iter().filter(|r| r.ok).count();
+            if ok_count < 2 {
+                lines.push("(need at least two successful locations to compare)".to_string());
+            } else if diffs.is_empty() {
+                lines.push(format!(
+                    "all {ok_count} locations returned identical status and headers"
+                ));
+            } else {
+                lines.push(format!("{} field(s) differ:", diffs.len()));
+                for d in diffs {
+                    lines.push(format!("  {}:", d.field));
+                    for (loc, val) in &d.values {
+                        lines.push(format!(
+                            "    {:<14} {}",
+                            loc,
+                            val.as_deref().unwrap_or("(absent)")
+                        ));
                     }
-                    if let Some(w) = &r.dns_warning {
-                        line.push_str(&format!("; warning: {w}"));
-                    }
-                    line
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                }
+            }
+            lines.join("\n")
+        }
+        Report::Verify { health } => {
+            if health.healthy {
+                return "ok — host network is consistent".to_string();
+            }
+            let mut lines = vec!["FAIL — host network needs repair:".to_string()];
+            lines.extend(
+                health
+                    .issues
+                    .iter()
+                    .map(|i| format!("  [{}] {}", i.kind, i.detail)),
+            );
+            lines.join("\n")
+        }
+        Report::Recover { recovered, health } => {
+            let mut lines: Vec<String> = if recovered.is_empty() {
+                vec!["nothing to recover — host state is clean".to_string()]
+            } else {
+                recovered
+                    .iter()
+                    .map(|r| {
+                        let mut line = format!("recovered {} ({})", r.tunnel, r.reason);
+                        if !r.dns_cleared.is_empty() {
+                            line.push_str(&format!(
+                                "; restored DNS on {}",
+                                r.dns_cleared.join(", ")
+                            ));
+                        }
+                        if let Some(w) = &r.dns_warning {
+                            line.push_str(&format!("; warning: {w}"));
+                        }
+                        line
+                    })
+                    .collect()
+            };
+            if !health.healthy {
+                lines.push("WARNING — host still inconsistent after recovery:".to_string());
+                lines.extend(
+                    health
+                        .issues
+                        .iter()
+                        .map(|i| format!("  [{}] {}", i.kind, i.detail)),
+                );
+            }
+            lines.join("\n")
         }
     }
 }
@@ -820,9 +914,19 @@ mod tests {
         assert_eq!(healthy.exit_code(), 0);
     }
 
+    fn healthy() -> crate::backend::HealthReport {
+        crate::backend::HealthReport {
+            healthy: true,
+            issues: vec![],
+        }
+    }
+
     #[test]
     fn human_recover_clean_and_populated() {
-        let clean = Report::Recover { recovered: vec![] };
+        let clean = Report::Recover {
+            recovered: vec![],
+            health: healthy(),
+        };
         assert!(render_report(&clean, false).contains("nothing to recover"));
 
         let populated = Report::Recover {
@@ -832,6 +936,7 @@ mod tests {
                 dns_cleared: vec!["Wi-Fi".into()],
                 dns_warning: None,
             }],
+            health: healthy(),
         };
         let text = render_report(&populated, false);
         assert!(text.contains("recovered proton"));
@@ -841,6 +946,88 @@ mod tests {
         let v: Value = serde_json::from_str(&render_report(&populated, true)).unwrap();
         assert_eq!(v["command"], "recover");
         assert_eq!(v["recovered"][0]["tunnel"], "proton");
+    }
+
+    #[test]
+    fn recover_exit_8_when_still_unhealthy() {
+        let report = Report::Recover {
+            recovered: vec![],
+            health: crate::backend::HealthReport {
+                healthy: false,
+                issues: vec![crate::backend::HealthIssue {
+                    kind: "orphan",
+                    detail: "utun7 orphaned".into(),
+                }],
+            },
+        };
+        assert_eq!(report.exit_code(), 8);
+        assert!(render_report(&report, false).contains("still inconsistent"));
+    }
+
+    #[test]
+    fn human_diff_reports_differences_and_json() {
+        use std::collections::BTreeMap;
+        let mk = |name: &str, cache: &str| crate::diff::LocationResult {
+            name: name.into(),
+            ok: true,
+            status: Some(200),
+            headers: BTreeMap::from([("cf-cache-status".to_string(), cache.to_string())]),
+            exit_ip: None,
+            error: None,
+        };
+        let results = vec![mk("proton-us", "HIT"), mk("proton-br", "MISS")];
+        let diffs = crate::diff::diff_fields(&results);
+        let report = Report::Diff {
+            url: "https://x.example".into(),
+            results,
+            diffs,
+        };
+        let text = render_report(&report, false);
+        assert!(text.contains("1 field(s) differ"));
+        assert!(text.contains("cf-cache-status"));
+        assert!(text.contains("HIT") && text.contains("MISS"));
+        assert_eq!(report.exit_code(), 0);
+        let v: Value = serde_json::from_str(&render_report(&report, true)).unwrap();
+        assert_eq!(v["command"], "diff");
+        assert_eq!(v["diffs"][0]["field"], "cf-cache-status");
+    }
+
+    #[test]
+    fn diff_exit_7_on_any_failure() {
+        let report = Report::Diff {
+            url: "u".into(),
+            results: vec![crate::diff::LocationResult {
+                name: "x".into(),
+                ok: false,
+                status: None,
+                headers: Default::default(),
+                exit_ip: None,
+                error: Some("boom".into()),
+            }],
+            diffs: vec![],
+        };
+        assert_eq!(report.exit_code(), 7);
+    }
+
+    #[test]
+    fn human_verify_healthy_and_unhealthy() {
+        let ok = Report::Verify { health: healthy() };
+        assert!(render_report(&ok, false).contains("consistent"));
+        assert_eq!(ok.exit_code(), 0);
+
+        let bad = Report::Verify {
+            health: crate::backend::HealthReport {
+                healthy: false,
+                issues: vec![crate::backend::HealthIssue {
+                    kind: "dns",
+                    detail: "stale VPN DNS pinned on Wi-Fi".into(),
+                }],
+            },
+        };
+        assert_eq!(bad.exit_code(), 8);
+        let text = render_report(&bad, false);
+        assert!(text.contains("needs repair"));
+        assert!(text.contains("[dns]"));
     }
 
     #[test]

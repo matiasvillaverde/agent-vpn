@@ -47,32 +47,38 @@ Crash-safe journal, reconcile-on-start, DNS snapshot/restore, leases, `recover`,
 config-hook privilege gate. The bar: you cannot make an interrupted sequence of
 commands leave the host broken.
 
-### M2 — Prove it, continuously *(next)*
+### M2 — Prove it, continuously *(partly shipped in 0.4.0)*
 Make the guarantees observable and self-checking.
-- **Post-condition verification built into every op.** After `up`, actively
-  prove egress flows (extend probe's trace check); after `down`, prove DNS
-  resolves *and* the default route is home — auto-recover if not. Turn the
-  invariants into runtime assertions, not just design intent.
-- **`vpn doctor --deep`**: dry-run a full up→probe→down→recover cycle on a
-  throwaway state dir and report any host residue.
-- **Linux parity + CI matrix.** DNS/route restoration is macOS-specific today;
-  bring the journal's route/interface reconciliation to Linux (`resolvconf`/
-  `systemd-resolved`) and test both in CI with a network namespace harness.
-- **Fuzz the reconcile state machine.** Property test: for any random sequence
-  of {up, down, probe, kill-at-phase-K, reboot} events, post-reconcile host
-  state equals the pre-first-`up` snapshot.
+- **✅ Host-health assertion.** `vpn verify` checks for orphaned WireGuard
+  interfaces, stale VPN DNS, and a default route held by an untracked tunnel;
+  `vpn recover` self-verifies afterwards. Both exit 8 when the host is
+  inconsistent — the invariants are now runtime assertions, not just intent.
+- **✅ Reconcile property test.** Exhaustive enumeration of the
+  (phase × live × lease × now) input space asserts the two safety invariants
+  (Healthy iff Active+live+in-lease; never tear down a dead interface).
+- **✅ Transient-op leases.** `probe`/`diff` activations carry a short lease so
+  a killed sweep self-heals instead of leaving a tunnel up.
+- **Post-`up` egress proof** *(next)*: after `up`, actively confirm traffic
+  egresses (extend probe's trace check) and roll back a silent blackhole.
+- **Linux parity + CI matrix** *(next, needs a Linux harness)*: DNS/route
+  restoration is macOS-specific today; bring the journal's route/interface
+  reconciliation to Linux (`resolvconf`/`systemd-resolved`) and test both in CI
+  with a network-namespace harness. Deliberately not shipped unverified.
+- **`vpn doctor --deep`** *(next)*: a safe self-test that exercises a
+  throwaway cycle and reports any host residue.
 
 ### M3 — The agent SDK surface
 Make it the obvious building block inside an agent loop.
+- **✅ Batch/compare primitive**: `vpn diff <url>` fetches through every
+  location and structurally diffs status + headers (shipped in 0.4.0). Next:
+  add a body-hash column (needs a binary-safe capture path) and per-location
+  exit-IP evidence.
 - **A stable JSON event contract** (`--json` on every subcommand, versioned
   schema) documented as an integration target.
 - **`vpn exec` hardening**: per-command network namespacing on Linux so only
   the child's traffic is tunneled (today the tunnel is system-wide for the
   command's duration — honestly documented, but namespacing is the real answer).
-- **Batch/compare primitives**: `vpn probe --json` already sweeps; add
-  `vpn diff <url>` that fetches through N locations and structurally diffs
-  headers/status/body-hash — the CDN-debugging workflow as one call.
-- **MCP server mode** (`vpn mcp`): expose list/up/down/probe/exec/recover as MCP
+- **MCP server mode** (`vpn mcp`): expose list/up/down/probe/diff/recover as MCP
   tools so any MCP-speaking agent gets world-egress with zero glue code.
 
 ### M4 — Fleet & scale
@@ -92,12 +98,19 @@ Make it the obvious building block inside an agent loop.
 - No silent privilege expansion. Anything that needs more than the two
   WireGuard binaries under NOPASSWD must be explicit and documented.
 
-## Immediate next steps (pull from M2)
+## Immediate next steps
 
-1. Post-`down` route-home verification + auto-recover (highest safety ROI).
-2. Linux DNS/route reconciliation + CI namespace harness (unblocks non-mac use).
-3. `doctor --deep` self-test cycle.
-4. Reconcile property/fuzz test.
+Done in 0.4.0: host-health verification (`vpn verify` + recover self-verify),
+reconcile property test, transient-op leases, and `vpn diff`. Remaining, in
+priority order:
+
+1. **Linux DNS/route reconciliation + CI namespace harness** — the biggest
+   unlock (non-macOS users) and the reason the current guarantees are
+   macOS-scoped. Requires a Linux test environment; will not ship unverified.
+2. **Post-`up` egress proof** — confirm traffic actually flows after `up`,
+   roll back a silent blackhole.
+3. **`vpn mcp`** — MCP server mode; the highest-leverage agent-integration win.
+4. **`doctor --deep`** — safe throwaway-cycle self-test.
 
 Each is independently shippable and moves a concrete invariant from "designed"
 to "continuously proven."

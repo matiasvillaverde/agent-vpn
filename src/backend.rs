@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cidr::{self, Cidr4};
 use crate::config::{self, Tunnel};
+use crate::diff;
 use crate::dns;
 use crate::error::{Error, Result};
 use crate::lint;
@@ -29,6 +30,10 @@ pub struct Backend<R: CommandRunner> {
     wg_quick: String,
     curl: String,
     dns_sweeps: Vec<u64>,
+    /// Delays (ms) before each `diff` fetch attempt; length = attempt count.
+    /// The spacing lets a freshly-activated tunnel finish its handshake before
+    /// an in-tunnel DNS lookup, which `probe` sidesteps by hitting an IP.
+    diff_retries: Vec<u64>,
     clock: Clock,
 }
 
@@ -67,8 +72,17 @@ impl<R: CommandRunner> Backend<R> {
             wg_quick: "wg-quick".to_string(),
             curl: "curl".to_string(),
             dns_sweeps: dns::SWEEP_DELAYS_MS.to_vec(),
+            diff_retries: vec![0, 800, 1600],
             clock: Clock::System,
         }
+    }
+
+    /// Override the `diff` fetch retry schedule (tests use a single attempt).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_diff_retries(mut self, delays_ms: Vec<u64>) -> Self {
+        self.diff_retries = delays_ms;
+        self
     }
 
     /// Override the DNS-guard sweep schedule (delays in ms before each
@@ -526,6 +540,77 @@ impl<R: CommandRunner> Backend<R> {
         declared
     }
 
+    /// Assert the host network is in a consistent state: no WireGuard interface
+    /// is live without a matching config (an orphan leaking traffic), no
+    /// network service is pinned to a tunnel's DNS while nothing is up, and the
+    /// default route is not held by an untracked tunnel. This is the runtime
+    /// form of the host invariant — read-only, safe to call anytime.
+    pub fn verify(&self) -> Result<HealthReport> {
+        let dump = self.all_dump()?;
+        let mut issues = Vec::new();
+
+        // Orphaned interfaces: a live WireGuard interface no config accounts for.
+        let default_iface = self.default_route_interface();
+        let mut wg_ifaces: Vec<String> = dump.iter().map(|d| d.interface.clone()).collect();
+        wg_ifaces.sort();
+        wg_ifaces.dedup();
+        for iface in &wg_ifaces {
+            if self.config_for_interface(iface, &dump).is_none() {
+                let owns_route = default_iface.as_deref() == Some(iface.as_str());
+                issues.push(HealthIssue {
+                    kind: "orphan",
+                    detail: format!(
+                        "WireGuard interface {iface} is live but no config matches it{} \
+                         — run `vpn recover`",
+                        if owns_route {
+                            " and it holds the default route"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
+        }
+
+        // Stale DNS: a service pinned to a known tunnel resolver while nothing
+        // is up (name resolution is dead until it is cleared).
+        let active = self.current().unwrap_or_default();
+        let declared = self.declared_dns_servers();
+        if active.is_empty() && !declared.is_empty() {
+            if let Some(stale) = dns::stale_services(&self.runner, &declared) {
+                if !stale.is_empty() {
+                    issues.push(HealthIssue {
+                        kind: "dns",
+                        detail: format!(
+                            "stale VPN DNS pinned on {} — name resolution is broken; \
+                             run `vpn recover`",
+                            stale.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(HealthReport {
+            healthy: issues.is_empty(),
+            issues,
+        })
+    }
+
+    /// The interface backing the current default route (e.g. `en0`), via
+    /// `route -n get default`. Unprivileged; `None` if it cannot be read.
+    fn default_route_interface(&self) -> Option<String> {
+        let out = self.runner.run(ROUTE, &route_default_args()).ok()?;
+        if !out.success() {
+            return None;
+        }
+        out.stdout.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("interface:")
+                .map(|iface| iface.trim().to_string())
+        })
+    }
+
     /// The discovered tunnel whose peer identity is live on `iface`, if any.
     /// Used by `recover` to map an orphan interface back to a config path
     /// (which `wg-quick down` requires on macOS).
@@ -687,9 +772,15 @@ impl<R: CommandRunner> Backend<R> {
                 result.error = Some(backend_error(&self.wg_quick, &out).to_string());
                 return Ok(result);
             }
+            // A short lease so a killed probe self-heals: if the process dies
+            // before the teardown below, reconciliation tears the tunnel down
+            // once the lease passes rather than leaving it up indefinitely.
+            let lease = max_time
+                .saturating_mul(u64::from(count))
+                .saturating_add(TRANSIENT_LEASE_BUFFER_SECS);
             let _ = state::write(
                 &self.config_dir,
-                &self.active_journal(tunnel, None, None, snapshot),
+                &self.active_journal(tunnel, None, Some(lease), snapshot),
             );
         }
 
@@ -743,6 +834,125 @@ impl<R: CommandRunner> Backend<R> {
 }
 
 impl<R: CommandRunner> Backend<R> {
+    /// Fetch `url` through one tunnel, or through every configured tunnel when
+    /// `name` is `None`, and return each location's status + headers for
+    /// comparison. Each fetch uses the same activate-run-restore care as
+    /// `probe`: a tunnel is brought up only if needed and restored afterwards.
+    ///
+    /// Per-location failures are embedded in the results; only environment
+    /// errors (missing tunnel, unspawnable `wg`) return `Err`.
+    pub fn diff(
+        &self,
+        name: Option<&str>,
+        url: &str,
+        max_time: u64,
+    ) -> Result<Vec<diff::LocationResult>> {
+        self.reconcile()?;
+        let tunnels = match name {
+            Some(n) => vec![config::resolve(&self.config_dir, n)?],
+            None => config::discover(&self.config_dir)?,
+        };
+        let mut results = Vec::with_capacity(tunnels.len());
+        for tunnel in &tunnels {
+            results.push(self.diff_one(tunnel, url, max_time)?);
+        }
+        Ok(results)
+    }
+
+    /// Fetch `url` once through `tunnel` (bringing it up if needed, restoring
+    /// after) and capture the response status and headers.
+    fn diff_one(&self, tunnel: &Tunnel, url: &str, max_time: u64) -> Result<diff::LocationResult> {
+        let dump = self.all_dump()?;
+        let was_up = self.find_live(tunnel, &dump)?.is_some();
+        if !was_up {
+            // Short lease so a killed diff self-heals (see probe_one).
+            let lease = max_time
+                .saturating_mul(self.diff_retries.len() as u64)
+                .saturating_add(TRANSIENT_LEASE_BUFFER_SECS);
+            if let Err(e) = self.activate(tunnel, Some(lease)) {
+                return Ok(diff::LocationResult {
+                    name: tunnel.name.clone(),
+                    ok: false,
+                    status: None,
+                    headers: Default::default(),
+                    exit_ip: None,
+                    error: Some(e.to_string()),
+                });
+            }
+        }
+
+        // Retry across the tunnel-settle window: a just-activated tunnel may
+        // not have finished its handshake, so the first in-tunnel DNS lookup
+        // can fail transiently. A tunnel that was already up gets one attempt.
+        let timeout = max_time.to_string();
+        let attempts = if was_up { &[0][..] } else { &self.diff_retries };
+        let mut fetched = Err("no attempt made".to_string());
+        for (i, delay) in attempts.iter().enumerate() {
+            if i > 0 && *delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(*delay));
+            }
+            fetched = self.diff_fetch(url, &timeout);
+            if fetched.is_ok() {
+                break;
+            }
+        }
+
+        if !was_up {
+            let _ = self.teardown(tunnel, true);
+        }
+
+        Ok(match fetched {
+            Ok(head) => diff::LocationResult {
+                name: tunnel.name.clone(),
+                ok: true,
+                status: head.status,
+                headers: head.headers,
+                exit_ip: None,
+                error: None,
+            },
+            Err(msg) => diff::LocationResult {
+                name: tunnel.name.clone(),
+                ok: false,
+                status: None,
+                headers: Default::default(),
+                exit_ip: None,
+                error: Some(msg),
+            },
+        })
+    }
+
+    /// Run one header-only `curl` and parse the status + headers.
+    fn diff_fetch(&self, url: &str, timeout: &str) -> std::result::Result<diff::Head, String> {
+        let write_out = format!("\n{}{}", probe::OUTPUT_MARKER, "%{http_code}");
+        let args: Vec<String> = [
+            "-sS",
+            "-m",
+            timeout,
+            "-D",
+            "-",
+            "-o",
+            "/dev/null",
+            "-w",
+            &write_out,
+            url,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        match self.runner.run(&self.curl, &args) {
+            Err(e) => Err(format!("failed to run '{}': {e}", self.curl)),
+            Ok(out) if !out.success() => {
+                let msg = out.stderr.trim();
+                Err(if msg.is_empty() {
+                    format!("{} exited {}", self.curl, out.code.unwrap_or(-1))
+                } else {
+                    msg.to_string()
+                })
+            }
+            Ok(out) => Ok(diff::parse_head(&out.stdout)),
+        }
+    }
+
     /// Lint one named tunnel, or every discovered tunnel. Pure file analysis —
     /// no privileged commands run.
     pub fn lint(&self, name: Option<&str>) -> Result<Vec<lint::LintResult>> {
@@ -933,6 +1143,41 @@ pub struct Recovered {
     /// Non-fatal DNS problem during recovery.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_warning: Option<String>,
+}
+
+/// The `route` binary (unprivileged; `route get` only reads the table).
+const ROUTE: &str = "route";
+
+/// Extra seconds added to a transient (probe/diff) activation's lease, so a
+/// killed operation's tunnel is reconciled away shortly after it would have
+/// finished rather than lingering.
+const TRANSIENT_LEASE_BUFFER_SECS: u64 = 60;
+
+/// Arguments to read the default route.
+fn route_default_args() -> Vec<String> {
+    ["-n", "get", "default"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// The result of `vpn verify`: whether the host network is consistent, and any
+/// problems found.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct HealthReport {
+    /// `true` when no issues were found.
+    pub healthy: bool,
+    /// Everything inconsistent about the current host state.
+    pub issues: Vec<HealthIssue>,
+}
+
+/// One host-health problem.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HealthIssue {
+    /// Category slug (`orphan`, `dns`).
+    pub kind: &'static str,
+    /// Human-readable explanation with a fix hint.
+    pub detail: String,
 }
 
 /// One environment check performed by `vpn doctor`.
@@ -1358,7 +1603,9 @@ mod tests {
     }
 
     fn backend(runner: MockRunner, cfg: &TempDir, sudo: bool) -> Backend<MockRunner> {
-        Backend::new(runner, cfg.path().to_path_buf(), sudo).with_dns_sweeps(vec![0, 0])
+        Backend::new(runner, cfg.path().to_path_buf(), sudo)
+            .with_dns_sweeps(vec![0, 0])
+            .with_diff_retries(vec![0])
     }
 
     #[test]
@@ -2978,6 +3225,123 @@ mod tests {
         runner.ok(""); // recover: all_dump — nothing live
         let b = backend(runner, &cfg, false);
         assert!(b.recover().unwrap().is_empty());
+    }
+
+    // ---- vpn verify (host-health assertion) ----
+
+    const ROUTE_HOME: &str = "   route to: default\ngateway: 172.20.0.1\n  interface: en0\n";
+    // A live WireGuard interface whose peer no config matches → an orphan.
+    const ORPHAN_DUMP: &str = "utun9\tIF\tIFP\t51820\toff\n\
+        utun9\tORPHANKEY\t(none)\t203.0.113.9:51820\t0.0.0.0/0\t1700000000\t1\t2\t25\n";
+
+    #[test]
+    fn verify_healthy_on_clean_host() {
+        let cfg = fixture(); // home.conf = CONF (no DNS)
+        let runner = MockRunner::new();
+        runner.ok(""); // verify: all_dump — nothing live
+        runner.ok(ROUTE_HOME); // route -n get default
+        runner.ok(""); // current(): all_dump — nothing up
+        let b = backend(runner, &cfg, false);
+        let health = b.verify().unwrap();
+        assert!(health.healthy);
+        assert!(health.issues.is_empty());
+    }
+
+    #[test]
+    fn verify_flags_orphan_interface_holding_the_route() {
+        let cfg = fixture(); // only home.conf (PEERKEY); utun9/ORPHANKEY matches nothing
+        let runner = MockRunner::new();
+        runner.ok(ORPHAN_DUMP); // verify: all_dump — utun9 live, unmatched
+        runner.ok("  interface: utun9\n"); // default route is via the orphan
+        runner.ok(ORPHAN_DUMP); // current(): all_dump (no config matches → empty)
+        let b = backend(runner, &cfg, false);
+        let health = b.verify().unwrap();
+        assert!(!health.healthy);
+        assert_eq!(health.issues.len(), 1);
+        assert_eq!(health.issues[0].kind, "orphan");
+        assert!(health.issues[0].detail.contains("utun9"));
+        assert!(health.issues[0].detail.contains("default route"));
+    }
+
+    #[test]
+    fn verify_flags_stale_dns_with_nothing_up() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(""); // verify: all_dump — nothing live
+        runner.ok(ROUTE_HOME); // route home (fine)
+        runner.ok(""); // current(): all_dump — nothing up
+        runner.ok(SERVICES); // stale_services: list
+        runner.ok("10.2.0.1"); // Wi-Fi pinned to the tunnel resolver
+        let b = backend(runner, &cfg, false);
+        let health = b.verify().unwrap();
+        assert!(!health.healthy);
+        assert_eq!(health.issues[0].kind, "dns");
+        assert!(health.issues[0].detail.contains("Wi-Fi"));
+    }
+
+    // ---- vpn diff (cross-location response comparison) ----
+
+    #[test]
+    fn diff_one_fetches_headers_and_restores() {
+        let cfg = fixture(); // home.conf = CONF (no DNS)
+        let header_out = format!(
+            "HTTP/2 200 \ncf-cache-status: HIT\ncontent-type: text/html\n\n{}200",
+            probe::OUTPUT_MARKER
+        );
+        let runner = MockRunner::new();
+        runner.ok(""); // diff_one: all_dump (detect, down)
+        runner.ok(""); // activate: wg-quick up
+        runner.ok(ALL_DUMP); // activate: all_dump (interface)
+        runner.ok(&header_out); // diff_fetch: curl headers
+        runner.ok(""); // teardown: wg-quick down
+        let b = backend(runner.clone(), &cfg, false);
+
+        let results = b.diff(Some("home"), "https://x.example", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert!(r.ok);
+        assert_eq!(r.status, Some(200));
+        assert_eq!(r.headers.get("cf-cache-status").unwrap(), "HIT");
+        // Tunnel state was restored (a wg-quick down ran).
+        assert!(runner
+            .calls()
+            .iter()
+            .any(|(_, a)| a.first().map(String::as_str) == Some("down")));
+        // curl fetched headers only (no body), through the tunnel.
+        let curl = runner
+            .calls()
+            .into_iter()
+            .find(|(p, _)| p == "curl")
+            .unwrap();
+        assert!(curl.1.contains(&"-D".to_string()) && curl.1.contains(&"-".to_string()));
+        assert_eq!(curl.1.last().unwrap(), "https://x.example");
+    }
+
+    #[test]
+    fn diff_records_fetch_failure_per_location() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // diff_one: all_dump — already up (no activate/teardown)
+        runner.fail(28, "curl: (28) timeout"); // curl fails
+        let b = backend(runner, &cfg, false);
+        let results = b.diff(Some("home"), "https://x.example", 5).unwrap();
+        assert!(!results[0].ok);
+        assert!(results[0].error.as_deref().unwrap().contains("timeout"));
+    }
+
+    #[test]
+    fn verify_healthy_when_a_tunnel_is_legitimately_up() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // verify: all_dump — home live on utun7
+        runner.ok(ROUTE_HOME); // route (irrelevant; tunnel owns DNS)
+        runner.ok(ALL_DUMP); // current(): home is up → active non-empty
+        let b = backend(runner, &cfg, false);
+        // utun7 matches home's config, and a tunnel is up, so DNS is owned.
+        let health = b.verify().unwrap();
+        assert!(health.healthy, "issues: {:?}", health.issues);
     }
 
     #[test]

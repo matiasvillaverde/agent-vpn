@@ -14,11 +14,19 @@ forward plan (see also [ROADMAP.md](ROADMAP.md)).
 | 3 — bounded blast radius | `up --lease <dur>` + watchdog | `Backend::up_with_lease`, `vpn recover` timer |
 | 4 — escape hatch | `vpn recover` (no config/name needed) | `Backend::recover` |
 
-Every mutating command (`up`/`down`/`probe`/`exec`/`recover`) reconciles first;
-read-only commands stay side-effect-free. All four layers are covered by unit
-tests (reconcile decision matrix, fault-injection via planted journals,
-snapshot capture/restore, lease expiry, orphan teardown) and verified live on
-macOS.
+Every mutating command (`up`/`down`/`probe`/`exec`/`diff`/`recover`) reconciles
+first; read-only commands stay side-effect-free. All four layers are covered by
+unit tests (reconcile decision matrix + an exhaustive property test,
+fault-injection via planted journals, snapshot capture/restore, lease expiry,
+orphan teardown) and verified live on macOS.
+
+**Runtime verification (0.4.0).** `vpn verify` turns the host invariant into a
+checkable assertion — orphaned interfaces, stale VPN DNS, a default route held
+by an untracked tunnel — exiting 8 when the host needs repair. `vpn recover`
+runs it automatically after repairing, so a recovery that didn't fully succeed
+is reported rather than assumed. Transient operations (`probe`/`diff`) now
+activate under a short lease, so a killed sweep self-heals instead of leaving a
+tunnel up.
 
 ## Why an agent-first VPN is a different problem
 

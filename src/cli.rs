@@ -139,6 +139,20 @@ pub enum Command {
         #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
         count: u32,
     },
+    /// Fetch a URL through one location, or every location in turn, and report
+    /// where the responses differ (status + headers). The CDN/geo-debugging
+    /// workflow — "is this edge serving stale content? does this region get a
+    /// different redirect?" — as one call. Tunnel state is restored afterwards.
+    Diff {
+        /// URL to fetch through each location.
+        url: String,
+        /// Tunnel name; omit to compare across every location.
+        #[arg(long)]
+        name: Option<String>,
+        /// Per-request timeout in seconds.
+        #[arg(long, default_value_t = 10)]
+        max_time: u64,
+    },
     /// Run a command with the tunnel up (activating it if needed, restoring
     /// afterwards); the command's stdio streams through and its exit code
     /// becomes vpn's exit code. Usage: `vpn exec <name> -- <command...>`.
@@ -198,11 +212,18 @@ pub enum Command {
     /// state access, and config validity/permissions. Exits 1 if anything
     /// fails, with a fix hint per check.
     Doctor,
-    /// Repair the host after a crash or a stuck tunnel: tear down every
-    /// WireGuard interface, restore each network service's DNS, and clear any
-    /// journaled state. Needs no tunnel name and tolerates missing configs —
-    /// the "my agent broke my network" button.
+    /// Repair the host after a crash or a stuck tunnel: reconcile interrupted
+    /// operations, tear down orphaned or expired tunnels, and restore each
+    /// network service's DNS. Needs no tunnel name and tolerates missing
+    /// configs — the "my agent broke my network" button. A tunnel deliberately
+    /// brought up with `vpn up` (and still within any lease) is left running;
+    /// use `vpn down` for that. Verifies the host afterwards (exit 8 if it is
+    /// still inconsistent).
     Recover,
+    /// Assert the host network is consistent: no orphaned WireGuard interface,
+    /// no stale VPN DNS, no default route held by an untracked tunnel. Exits 8
+    /// (with the problems listed) when the host needs `vpn recover`; read-only.
+    Verify,
 }
 
 /// Parse a lease duration like `30m`, `2h`, `90s`, `1d` (bare number = seconds)
@@ -290,6 +311,19 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         } => Ok(Report::Probe {
             results: backend.probe(name.as_deref(), url, *max_time, *count)?,
         }),
+        Command::Diff {
+            url,
+            name,
+            max_time,
+        } => {
+            let results = backend.diff(name.as_deref(), url, *max_time)?;
+            let diffs = crate::diff::diff_fields(&results);
+            Ok(Report::Diff {
+                url: url.clone(),
+                results,
+                diffs,
+            })
+        }
         Command::Exec { name, command } => {
             let outcome = backend.exec_through(name, command)?;
             Ok(Report::Exec {
@@ -334,8 +368,14 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         Command::Doctor => Ok(Report::Doctor {
             checks: backend.doctor(),
         }),
-        Command::Recover => Ok(Report::Recover {
-            recovered: backend.recover()?,
+        Command::Recover => {
+            let recovered = backend.recover()?;
+            // Self-verify: prove the repair worked (or report what's left).
+            let health = backend.verify()?;
+            Ok(Report::Recover { recovered, health })
+        }
+        Command::Verify => Ok(Report::Verify {
+            health: backend.verify()?,
         }),
     }
 }
@@ -595,11 +635,20 @@ mod tests {
 
     #[test]
     fn dispatch_recover_reports_clean_host() {
-        let runner = MockRunner::new();
-        runner.ok(""); // recover: all_dump — nothing live
+        let runner = MockRunner::new(); // unscripted calls default to ok("")
         let (b, _cfg) = backend_with(runner);
         let report = dispatch(&b, &Command::Recover).unwrap();
-        assert!(matches!(report, Report::Recover { recovered } if recovered.is_empty()));
+        assert!(matches!(report, Report::Recover { recovered, health }
+            if recovered.is_empty() && health.healthy));
+    }
+
+    #[test]
+    fn dispatch_verify_ok_on_clean_host() {
+        let runner = MockRunner::new();
+        let (b, _cfg) = backend_with(runner);
+        let report = dispatch(&b, &Command::Verify).unwrap();
+        assert_eq!(report.exit_code(), 0);
+        assert!(matches!(report, Report::Verify { health } if health.healthy));
     }
 
     #[test]

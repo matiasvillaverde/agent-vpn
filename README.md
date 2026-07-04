@@ -65,7 +65,8 @@ becomes vpn's exit code.
   | 4 | invalid tunnel name |
   | 5 | backend command exited non-zero |
   | 6 | backend command could not be launched |
-  | 7 | at least one probe request failed (results still on stdout) |
+  | 7 | at least one `probe`/`diff` request failed (results still on stdout) |
+  | 8 | `verify`/`recover`: host network is inconsistent (needs repair) |
   | * | `exec` passes the child command's exit code through |
 
 - **Machine-readable** — `--json` on every command.
@@ -105,9 +106,16 @@ becomes vpn's exit code.
   the next vpn command (or a scheduled `vpn recover`) tears the tunnel down and
   restores the host once it passes, so an agent that dies without calling
   `down` can't strand you on a foreign exit forever.
-- **An escape hatch** — `vpn recover` needs no tunnel name and tolerates
-  missing configs: it tears down every WireGuard interface, restores DNS, and
-  clears journaled state. The "my agent broke my network" button.
+- **An escape hatch + a health assertion** — `vpn recover` needs no tunnel
+  name and tolerates missing configs: it reconciles interrupted operations,
+  tears down orphaned/expired tunnels, restores DNS, and then **self-verifies**
+  (exit 8 if the host is somehow still inconsistent). `vpn verify` is the
+  standalone, read-only version — an agent or CI job can assert "my network is
+  in a sane state" and branch on the exit code.
+- **`diff` across locations** — `vpn diff <url>` fetches the same URL through
+  every location and reports which response fields (status, headers) differ:
+  the "is São Paulo serving stale content? does Australia get a different
+  redirect?" CDN/geo-debugging workflow as one call, with `--json` output.
 - **Least privilege** — `wg-quick` runs config `PreUp`/`PostUp`/`PreDown`/
   `PostDown` hooks as **root**; combined with a user-writable config dir and
   the NOPASSWD sudoers rule below, that is a privilege-escalation path. vpn
@@ -151,7 +159,9 @@ vpn probe --count 5      # sweep every location, median of 5, fastest first
 vpn exec proton-us -- curl -sI https://yoursite.com   # any command, through the tunnel
 vpn up proton-us --lease 30m   # auto-tear-down deadline (safety net for agents)
 vpn down proton-us       # bring it down       (idempotent)
-vpn recover              # emergency: tear down everything, restore the host
+vpn diff https://yoursite.com  # fetch through every location, diff status+headers
+vpn verify               # assert the host network is consistent (exit 8 if not)
+vpn recover              # repair a crashed/stuck host, then self-verify
 
 vpn add ~/Downloads/wg-tokyo.conf --name proton-jp    # validate + install (0600)
 vpn split proton-jp --exclude 100.64.0.0/10           # Tailscale-safe sibling config

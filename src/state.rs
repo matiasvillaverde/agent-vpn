@@ -395,6 +395,50 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_invariants_hold_across_the_whole_input_space() {
+        // Exhaustively enumerate every (phase, live, lease, now) combination and
+        // assert the two safety invariants of the reconcile decision:
+        //   1. Healthy IFF the tunnel is Active, live, and within its lease.
+        //   2. We never tear down an interface that is not live.
+        // This is the crash-recovery core: if it is sound, no interrupted
+        // sequence can leave the host in a state reconcile won't fix.
+        let phases = [Phase::UpPending, Phase::Active, Phase::DownPending];
+        let leases = [None, Some(500u64)];
+        let nows = [0u64, 499, 500, 501, 1_000];
+        for phase in phases {
+            for &live in &[true, false] {
+                for lease in leases {
+                    for now in nows {
+                        let j = Journal {
+                            tunnel: "t".to_string(),
+                            phase,
+                            interface: Some("utun0".to_string()),
+                            lease_deadline: lease,
+                            dns_snapshot: BTreeMap::new(),
+                            tunnel_dns: Vec::new(),
+                        };
+                        let decision = reconcile_one(&j, live, now);
+                        let expired = lease.is_some_and(|d| now >= d);
+                        let expect_healthy = phase == Phase::Active && live && !expired;
+                        assert_eq!(
+                            matches!(decision, Reconciliation::Healthy),
+                            expect_healthy,
+                            "phase={phase:?} live={live} lease={lease:?} now={now}"
+                        );
+                        if let Reconciliation::Recover { tear_down, .. } = decision {
+                            assert!(
+                                !tear_down || live,
+                                "never tear down a dead interface: \
+                                 phase={phase:?} live={live} lease={lease:?} now={now}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn lease_expired_boundary() {
         let mut j = journal(Phase::Active);
         assert!(!j.lease_expired(5));
