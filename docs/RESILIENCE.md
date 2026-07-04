@@ -1,7 +1,24 @@
 # Resilience & Security Design
 
-**Status:** proposal — Layer 1 (least privilege) is partly shipped; Layers 2–4 await approval.
+**Status:** Layers 1–4 shipped in 0.3.0. This document is now both the design
+record and the map of what exists; the "proposed next" items remain the
+forward plan (see also [ROADMAP.md](ROADMAP.md)).
 **Goal:** bank-level reliability and security for a VPN CLI *driven by autonomous agents*.
+
+## What shipped (0.3.0)
+
+| Layer | Mechanism | Commands / code |
+|---|---|---|
+| 1 — least privilege | Config shell-hook gate (root-exec) | `add`/`lint`/`doctor`/`split`, `src/config.rs` |
+| 2 — crash-safe state | On-disk journal + reconcile-on-start; DNS snapshot/restore | `src/state.rs`, `src/dns.rs`, `Backend::reconcile` |
+| 3 — bounded blast radius | `up --lease <dur>` + watchdog | `Backend::up_with_lease`, `vpn recover` timer |
+| 4 — escape hatch | `vpn recover` (no config/name needed) | `Backend::recover` |
+
+Every mutating command (`up`/`down`/`probe`/`exec`/`recover`) reconciles first;
+read-only commands stay side-effect-free. All four layers are covered by unit
+tests (reconcile decision matrix, fault-injection via planted journals,
+snapshot capture/restore, lease expiry, orphan teardown) and verified live on
+macOS.
 
 ## Why an agent-first VPN is a different problem
 

@@ -19,6 +19,7 @@ pub mod output;
 pub mod probe;
 pub mod runner;
 pub mod settings;
+pub mod state;
 pub mod status;
 
 #[cfg(test)]
@@ -69,6 +70,7 @@ pub fn execute<R: CommandRunner>(runner: R, cli: &Cli) -> Execution {
             | cli::Command::Exec { .. }
             | cli::Command::Add { .. }
             | cli::Command::Split { .. }
+            | cli::Command::Recover
     );
     let _lock = if needs_lock {
         match lock::Lock::acquire(&effective.config_dir) {

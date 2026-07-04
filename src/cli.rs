@@ -104,6 +104,12 @@ pub enum Command {
     Up {
         /// Tunnel name (config file stem).
         name: String,
+        /// Auto-tear-down deadline (e.g. `30m`, `2h`, `90s`, `1d`). After it
+        /// passes, the next `vpn` command (or `vpn recover`) brings the tunnel
+        /// down and restores the host — a safety net for agents that die
+        /// without calling `down`.
+        #[arg(long, value_parser = parse_duration)]
+        lease: Option<u64>,
     },
     /// Bring a tunnel down (idempotent).
     Down {
@@ -192,6 +198,39 @@ pub enum Command {
     /// state access, and config validity/permissions. Exits 1 if anything
     /// fails, with a fix hint per check.
     Doctor,
+    /// Repair the host after a crash or a stuck tunnel: tear down every
+    /// WireGuard interface, restore each network service's DNS, and clear any
+    /// journaled state. Needs no tunnel name and tolerates missing configs —
+    /// the "my agent broke my network" button.
+    Recover,
+}
+
+/// Parse a lease duration like `30m`, `2h`, `90s`, `1d` (bare number = seconds)
+/// into whole seconds. Rejects zero and overflow.
+fn parse_duration(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86_400),
+        Some(c) if c.is_ascii_digit() => (s, 1),
+        _ => {
+            return Err(format!(
+                "invalid duration '{s}' (use e.g. 30m, 2h, 90s, 1d)"
+            ))
+        }
+    };
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid duration '{s}' (use e.g. 30m, 2h, 90s, 1d)"))?;
+    let secs = value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("duration '{s}' is too large"))?;
+    if secs == 0 {
+        return Err("duration must be greater than zero".to_string());
+    }
+    Ok(secs)
 }
 
 /// The default config directory, `$HOME/.config/vpn`.
@@ -216,8 +255,8 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
             config_dir: backend.config_dir().display().to_string(),
             tunnels: backend.list()?,
         }),
-        Command::Up { name } => {
-            let (changed, status) = backend.up(name)?;
+        Command::Up { name, lease } => {
+            let (changed, status) = backend.up_with_lease(name, *lease)?;
             Ok(Report::Up {
                 name: name.clone(),
                 changed,
@@ -295,6 +334,9 @@ pub fn dispatch<R: CommandRunner>(backend: &Backend<R>, command: &Command) -> Re
         Command::Doctor => Ok(Report::Doctor {
             checks: backend.doctor(),
         }),
+        Command::Recover => Ok(Report::Recover {
+            recovered: backend.recover()?,
+        }),
     }
 }
 
@@ -332,7 +374,41 @@ mod tests {
         assert!(cli.json);
         assert!(cli.sudo);
         assert_eq!(cli.resolved_config_dir(), PathBuf::from("/tmp/cfg"));
-        assert!(matches!(cli.command, Command::Up { name } if name == "home"));
+        assert!(matches!(cli.command, Command::Up { name, .. } if name == "home"));
+    }
+
+    #[test]
+    fn parse_duration_units_and_rejections() {
+        assert_eq!(parse_duration("90s"), Ok(90));
+        assert_eq!(parse_duration("30m"), Ok(1800));
+        assert_eq!(parse_duration("2h"), Ok(7200));
+        assert_eq!(parse_duration("1d"), Ok(86_400));
+        assert_eq!(parse_duration("45"), Ok(45)); // bare = seconds
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("0m").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("10x").is_err());
+        assert!(parse_duration("99999999999999999999d").is_err()); // overflow
+    }
+
+    #[test]
+    fn cli_parses_up_lease() {
+        let cli = Cli::try_parse_from(["vpn", "up", "home", "--lease", "30m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Up {
+                lease: Some(1800),
+                ..
+            }
+        ));
+        // Invalid lease is rejected at parse time.
+        assert!(Cli::try_parse_from(["vpn", "up", "home", "--lease", "nope"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_recover() {
+        let cli = Cli::try_parse_from(["vpn", "recover"]).unwrap();
+        assert!(matches!(cli.command, Command::Recover));
     }
 
     #[test]
@@ -518,6 +594,15 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_recover_reports_clean_host() {
+        let runner = MockRunner::new();
+        runner.ok(""); // recover: all_dump — nothing live
+        let (b, _cfg) = backend_with(runner);
+        let report = dispatch(&b, &Command::Recover).unwrap();
+        assert!(matches!(report, Report::Recover { recovered } if recovered.is_empty()));
+    }
+
+    #[test]
     fn dispatch_up() {
         let runner = MockRunner::new();
         runner.ok(""); // all_dump: down
@@ -528,6 +613,7 @@ mod tests {
             &b,
             &Command::Up {
                 name: "home".into(),
+                lease: None,
             },
         )
         .unwrap();
@@ -614,6 +700,7 @@ mod tests {
             &b,
             &Command::Up {
                 name: "ghost".into(),
+                lease: None,
             },
         )
         .unwrap_err();

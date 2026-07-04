@@ -63,42 +63,132 @@ impl GuardOutcome {
     }
 }
 
-/// Network services whose static DNS currently contains one of `tunnel_dns`.
-///
-/// Returns `None` when `networksetup` cannot run (not macOS) — the caller
-/// should treat the check as not applicable.
-pub fn stale_services<R: CommandRunner>(runner: &R, tunnel_dns: &[String]) -> Option<Vec<String>> {
+/// The list of configurable network services, in `networksetup` order.
+/// `None` when `networksetup` cannot run (not macOS).
+fn list_services<R: CommandRunner>(runner: &R) -> Option<Vec<String>> {
     let list = runner
         .run(NETWORKSETUP, &["-listallnetworkservices".to_string()])
         .ok()?;
     if !list.success() {
         return None;
     }
-    let mut stale = Vec::new();
     // The first line is a legend ("An asterisk (*) denotes ..."); a leading
     // '*' marks a disabled service, which still carries DNS settings.
-    for raw in list.stdout.lines().skip(1) {
-        let service = raw.trim().trim_start_matches('*').trim();
-        if service.is_empty() {
-            continue;
-        }
-        let Ok(out) = runner.run(
+    Some(
+        list.stdout
+            .lines()
+            .skip(1)
+            .map(|raw| raw.trim().trim_start_matches('*').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+/// The static DNS servers currently set on `service` (empty = DHCP).
+/// `None` when the query itself could not run.
+fn service_dns<R: CommandRunner>(runner: &R, service: &str) -> Option<Vec<String>> {
+    let out = runner
+        .run(
             NETWORKSETUP,
             &["-getdnsservers".to_string(), service.to_string()],
-        ) else {
-            return None;
-        };
-        // Output is one server per line, or a sentence ("There aren't any
-        // DNS Servers set on ...") that never equals an address.
-        if out
-            .stdout
+        )
+        .ok()?;
+    // Output is one server per line, or a sentence ("There aren't any DNS
+    // Servers set on ...") — server lines carry no whitespace.
+    Some(
+        out.stdout
             .lines()
-            .any(|line| tunnel_dns.iter().any(|dns| dns == line.trim()))
-        {
-            stale.push(service.to_string());
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.contains(char::is_whitespace))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Network services whose static DNS currently contains one of `tunnel_dns`.
+///
+/// Returns `None` when `networksetup` cannot run (not macOS) — the caller
+/// should treat the check as not applicable.
+pub fn stale_services<R: CommandRunner>(runner: &R, tunnel_dns: &[String]) -> Option<Vec<String>> {
+    let services = list_services(runner)?;
+    let mut stale = Vec::new();
+    for service in services {
+        let servers = service_dns(runner, &service)?;
+        if servers.iter().any(|s| tunnel_dns.contains(s)) {
+            stale.push(service);
         }
     }
     Some(stale)
+}
+
+/// Snapshot each service's current DNS, **sanitized**: any server equal to a
+/// `tunnel_dns` entry is dropped. Taking the snapshot from an already-poisoned
+/// system therefore still yields a clean baseline (an empty list = DHCP), so
+/// restoring it can never re-pin the tunnel's resolver.
+///
+/// `None` when `networksetup` is unavailable.
+pub fn capture<R: CommandRunner>(
+    runner: &R,
+    tunnel_dns: &[String],
+) -> Option<std::collections::BTreeMap<String, Vec<String>>> {
+    let services = list_services(runner)?;
+    let mut snapshot = std::collections::BTreeMap::new();
+    for service in services {
+        let servers = service_dns(runner, &service)?;
+        let clean: Vec<String> = servers
+            .into_iter()
+            .filter(|s| !tunnel_dns.contains(s))
+            .collect();
+        snapshot.insert(service, clean);
+    }
+    Some(snapshot)
+}
+
+/// Restore each service in `snapshot` to its recorded DNS (an empty list resets
+/// it to DHCP), then run [`guard`] to verify no tunnel resolver lingers — this
+/// mops up asynchronous re-stamps by `wg-quick`'s monitor and any service
+/// outside the snapshot. Returns the combined outcome.
+pub fn restore<R: CommandRunner>(
+    runner: &R,
+    snapshot: &std::collections::BTreeMap<String, Vec<String>>,
+    tunnel_dns: &[String],
+    sweep_delays_ms: &[u64],
+) -> GuardOutcome {
+    let mut restored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut warning = None;
+    for (service, servers) in snapshot {
+        let mut args = vec!["-setdnsservers".to_string(), service.clone()];
+        if servers.is_empty() {
+            args.push("Empty".to_string());
+        } else {
+            args.extend(servers.iter().cloned());
+        }
+        let ok = runner
+            .run(NETWORKSETUP, &args)
+            .map(|out| out.success())
+            .unwrap_or(false);
+        if ok {
+            restored.insert(service.clone());
+        } else {
+            warning = Some(format!(
+                "could not restore DNS on '{service}' — run: networksetup -setdnsservers '{service}' {}",
+                if servers.is_empty() { "Empty".to_string() } else { servers.join(" ") }
+            ));
+        }
+    }
+    // Safety net: clear any residual poison the snapshot pass did not cover.
+    let mut outcome = guard(runner, tunnel_dns, sweep_delays_ms);
+    for service in restored {
+        if !outcome.cleared.contains(&service) {
+            outcome.cleared.push(service);
+        }
+    }
+    outcome.cleared.sort();
+    outcome.cleared.dedup();
+    if outcome.warning.is_none() {
+        outcome.warning = warning;
+    }
+    outcome
 }
 
 /// Reset any service still pinned to `tunnel_dns` back to DHCP, sweeping on
@@ -263,6 +353,78 @@ mod tests {
         assert!(outcome.cleared.is_empty());
         let note = outcome.note().unwrap();
         assert!(note.contains("could not reset DNS on 'Wi-Fi'"));
+    }
+
+    #[test]
+    fn capture_sanitizes_poison_and_keeps_custom_dns() {
+        let mock = MockRunner::new();
+        mock.ok(&format!("{LEGEND}\nWi-Fi\nEthernet\nStale\n"));
+        mock.ok("9.9.9.9\n149.112.112.112"); // Wi-Fi: real custom DNS, kept
+        mock.ok("There aren't any DNS Servers set on Ethernet."); // DHCP
+        mock.ok("10.2.0.1\n9.9.9.9"); // Stale: poison stripped, custom kept
+        let snap = capture(&mock, &dns()).unwrap();
+        assert_eq!(snap["Wi-Fi"], vec!["9.9.9.9", "149.112.112.112"]);
+        assert!(snap["Ethernet"].is_empty());
+        assert_eq!(snap["Stale"], vec!["9.9.9.9"], "tunnel DNS filtered out");
+    }
+
+    #[test]
+    fn capture_none_without_networksetup() {
+        let mock = MockRunner::new();
+        mock.spawn_err();
+        assert!(capture(&mock, &dns()).is_none());
+    }
+
+    #[test]
+    fn restore_reapplies_snapshot_and_verifies_clean() {
+        use std::collections::BTreeMap;
+        let snapshot = BTreeMap::from([
+            ("Wi-Fi".to_string(), vec!["9.9.9.9".to_string()]),
+            ("Ethernet".to_string(), Vec::new()),
+        ]);
+        let mock = MockRunner::new();
+        mock.ok(""); // set Wi-Fi 9.9.9.9
+        mock.ok(""); // set Ethernet Empty
+                     // guard() safety net: one clean sweep pair.
+        mock.ok(&format!("{LEGEND}\nWi-Fi\nEthernet\n"));
+        mock.ok("9.9.9.9");
+        mock.ok("There aren't any DNS Servers set on Ethernet.");
+        mock.ok(&format!("{LEGEND}\nWi-Fi\nEthernet\n"));
+        mock.ok("9.9.9.9");
+        mock.ok("There aren't any DNS Servers set on Ethernet.");
+        let outcome = restore(&mock, &snapshot, &dns(), &[0, 0, 0]);
+        assert!(outcome.warning.is_none());
+        assert_eq!(
+            outcome.cleared,
+            vec!["Ethernet".to_string(), "Wi-Fi".to_string()]
+        );
+        // Wi-Fi was set to its custom value, not Empty.
+        let set_wifi = mock
+            .calls()
+            .into_iter()
+            .find(|(_, a)| {
+                a.first().map(String::as_str) == Some("-setdnsservers") && a[1] == "Wi-Fi"
+            })
+            .unwrap();
+        assert_eq!(set_wifi.1, vec!["-setdnsservers", "Wi-Fi", "9.9.9.9"]);
+    }
+
+    #[test]
+    fn restore_warns_when_reapply_fails() {
+        use std::collections::BTreeMap;
+        let snapshot = BTreeMap::from([("Wi-Fi".to_string(), vec!["9.9.9.9".to_string()])]);
+        let mock = MockRunner::new();
+        mock.fail(1, "not admin"); // set Wi-Fi fails
+                                   // guard net: clean immediately (nothing poisoned to clear).
+        mock.ok(&format!("{LEGEND}\nWi-Fi\n"));
+        mock.ok("There aren't any DNS Servers set on Wi-Fi.");
+        mock.ok(&format!("{LEGEND}\nWi-Fi\n"));
+        mock.ok("There aren't any DNS Servers set on Wi-Fi.");
+        let outcome = restore(&mock, &snapshot, &dns(), &[0, 0, 0]);
+        assert!(outcome
+            .warning
+            .unwrap()
+            .contains("could not restore DNS on 'Wi-Fi'"));
     }
 
     #[test]

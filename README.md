@@ -83,17 +83,37 @@ becomes vpn's exit code.
 - **macOS-correct** — live tunnels are detected by matching each config's peer
   key and allowed-IPs against one `wg show all dump`, so `status` / `down` /
   `current` work even though `wg-quick`'s interface-name file is root-only.
-- **DNS self-healing (macOS)** — on macOS, `wg-quick` remembers your original
-  DNS only in the memory of a background process; if that process dies without
-  restoring it (shutdown or crash with a tunnel up, rapid up/down cycles), the
-  tunnel's VPN-internal resolver stays pinned on every network service and the
-  machine has no working DNS whenever tunnels are down — and every later `up`
-  snapshots the broken value as the "original", perpetuating it. After each
-  teardown, `vpn down` (and the restore step of `probe`/`exec`) detects
-  services still pinned to the tunnel's own `DNS` servers and resets them to
-  DHCP, re-checking on a short schedule to outlast `wg-quick`'s asynchronous
-  restore. Running `vpn down` on an already-down tunnel repairs the state
-  explicitly, and `vpn doctor` flags it (check `dns`) with a fix hint.
+- **Crash-safe & self-healing** — an agent gets killed mid-operation as a
+  matter of course (context limits, timeouts, a closing lid). Before every
+  host mutation, vpn writes a small journal to `~/.config/vpn/state/` capturing
+  the pre-tunnel DNS; every command then begins by **reconciling** that journal
+  against the live system, so a half-finished `up`/`down` — even after
+  `kill -9` or a reboot — is rolled back to a working network the next time vpn
+  runs. The recovery data lives on disk, never in a process that can die with
+  it. See **[docs/RESILIENCE.md](docs/RESILIENCE.md)** for the full design.
+- **DNS restore, done right (macOS)** — `wg-quick` remembers your original DNS
+  only in the memory of a background process; if that dies without restoring it
+  (shutdown/crash with a tunnel up, or the rapid up/down cycles a `probe` sweep
+  makes), the tunnel's VPN-internal resolver stays pinned on every network
+  service — so the machine has no working DNS whenever tunnels are down, and
+  every later `up` snapshots the broken value, perpetuating it. vpn instead
+  snapshots the *real* pre-tunnel DNS and restores exactly that (custom static
+  DNS included, not just DHCP), re-checking on a short schedule to outlast
+  `wg-quick`'s asynchronous restore. `vpn down` on an already-down tunnel
+  repairs the state explicitly, and `vpn doctor` flags it (check `dns`).
+- **Bounded blast radius** — `vpn up <name> --lease 30m` records a deadline;
+  the next vpn command (or a scheduled `vpn recover`) tears the tunnel down and
+  restores the host once it passes, so an agent that dies without calling
+  `down` can't strand you on a foreign exit forever.
+- **An escape hatch** — `vpn recover` needs no tunnel name and tolerates
+  missing configs: it tears down every WireGuard interface, restores DNS, and
+  clears journaled state. The "my agent broke my network" button.
+- **Least privilege** — `wg-quick` runs config `PreUp`/`PostUp`/`PreDown`/
+  `PostDown` hooks as **root**; combined with a user-writable config dir and
+  the NOPASSWD sudoers rule below, that is a privilege-escalation path. vpn
+  refuses to `add` a config containing hooks (even under `--force`; only the
+  explicit `--allow-hooks` installs one), `lint` flags them, `doctor` reports
+  any installed, and `split` strips them from generated siblings.
 
 ## Install
 
@@ -129,7 +149,9 @@ vpn current              # names of active tunnels
 vpn probe proton-us      # one timed request, state restored afterwards
 vpn probe --count 5      # sweep every location, median of 5, fastest first
 vpn exec proton-us -- curl -sI https://yoursite.com   # any command, through the tunnel
+vpn up proton-us --lease 30m   # auto-tear-down deadline (safety net for agents)
 vpn down proton-us       # bring it down       (idempotent)
+vpn recover              # emergency: tear down everything, restore the host
 
 vpn add ~/Downloads/wg-tokyo.conf --name proton-jp    # validate + install (0600)
 vpn split proton-jp --exclude 100.64.0.0/10           # Tailscale-safe sibling config
@@ -176,6 +198,26 @@ After that, the agent's entire vocabulary is `vpn probe`, `vpn up <name>`,
 > `vpn lint` flags them as errors, `vpn doctor` reports any already installed,
 > and `vpn split` strips them from generated siblings. If you genuinely need a
 > hook and fully trust the file, install it with `vpn add … --allow-hooks`.
+
+**3. (Optional) A lease watchdog.** Leases are enforced whenever any mutating
+vpn command runs, but if an agent dies and nothing runs again, the tunnel stays
+up until its deadline is noticed. To enforce leases even then, schedule
+`vpn recover` — it tears down any expired or orphaned tunnel and restores the
+host. A minimal launchd agent that runs it every minute:
+
+```sh
+cat > ~/Library/LaunchAgents/com.agent-vpn.watchdog.plist <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.agent-vpn.watchdog</string>
+  <key>ProgramArguments</key>
+  <array><string>/opt/homebrew/bin/vpn</string><string>recover</string></array>
+  <key>StartInterval</key><integer>60</integer>
+</dict></plist>
+PLIST
+launchctl load ~/Library/LaunchAgents/com.agent-vpn.watchdog.plist
+```
 
 Settings resolve as: **CLI flag / env → `config.toml` → built-in default**.
 

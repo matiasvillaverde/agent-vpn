@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::lint;
 use crate::probe::{self, ProbeResult};
 use crate::runner::{CommandOutput, CommandRunner};
+use crate::state::{self, Journal, Phase, Reconciliation};
 use crate::status::{self, DumpPeer, ListEntry, TunnelStatus};
 
 /// Orchestrates `wg-quick`/`wg`/`curl` for a set of tunnel configs.
@@ -28,6 +29,26 @@ pub struct Backend<R: CommandRunner> {
     wg_quick: String,
     curl: String,
     dns_sweeps: Vec<u64>,
+    clock: Clock,
+}
+
+/// Time source for lease deadlines; swappable so tests are deterministic.
+#[derive(Debug, Clone, Copy)]
+enum Clock {
+    /// Real wall-clock time.
+    System,
+    /// A fixed Unix timestamp (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fixed(u64),
+}
+
+impl Clock {
+    fn now(&self) -> u64 {
+        match self {
+            Clock::System => crate::state::now_unix(),
+            Clock::Fixed(t) => *t,
+        }
+    }
 }
 
 impl<R: CommandRunner> Backend<R> {
@@ -46,6 +67,7 @@ impl<R: CommandRunner> Backend<R> {
             wg_quick: "wg-quick".to_string(),
             curl: "curl".to_string(),
             dns_sweeps: dns::SWEEP_DELAYS_MS.to_vec(),
+            clock: Clock::System,
         }
     }
 
@@ -54,6 +76,14 @@ impl<R: CommandRunner> Backend<R> {
     #[must_use]
     pub fn with_dns_sweeps(mut self, sweep_delays_ms: Vec<u64>) -> Self {
         self.dns_sweeps = sweep_delays_ms;
+        self
+    }
+
+    /// Pin the clock to a fixed Unix timestamp (tests, for lease determinism).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_fixed_time(mut self, now: u64) -> Self {
+        self.clock = Clock::Fixed(now);
         self
     }
 
@@ -172,43 +202,55 @@ impl<R: CommandRunner> Backend<R> {
     }
 
     /// Bring a tunnel up. Returns `(changed, status)` where `changed` is `false`
-    /// if it was already up.
+    /// if it was already up. `lease_secs`, when set, records a deadline after
+    /// which reconciliation tears the tunnel down automatically.
     pub fn up(&self, name: &str) -> Result<(bool, TunnelStatus)> {
+        self.up_with_lease(name, None)
+    }
+
+    /// [`Backend::up`] with an optional lease duration in seconds.
+    pub fn up_with_lease(
+        &self,
+        name: &str,
+        lease_secs: Option<u64>,
+    ) -> Result<(bool, TunnelStatus)> {
+        self.reconcile()?;
         let tunnel = config::resolve(&self.config_dir, name)?;
         let dump = self.all_dump()?;
         if let Some(live) = self.find_live(&tunnel, &dump)? {
+            // Already up: adopt it into the journal if untracked, so a later
+            // crash still self-heals. No host mutation, no capture.
+            if state::read(&self.config_dir, name).is_none() {
+                let _ = state::write(
+                    &self.config_dir,
+                    &self.active_journal(
+                        &tunnel,
+                        Some(live.interface.clone()),
+                        lease_secs,
+                        Default::default(),
+                    ),
+                );
+            }
             return Ok((false, self.status_from(name, Some(live), &dump)));
         }
-        let path = tunnel.path.to_string_lossy().into_owned();
-        let out = self.exec(&self.wg_quick, &["up", &path])?;
-        if !out.success() {
-            return Err(backend_error(&self.wg_quick, &out));
-        }
-        Ok((true, self.status_one(name)?))
+        let status = self.activate(&tunnel, lease_secs)?;
+        Ok((true, status))
     }
 
-    /// Bring a tunnel down, then run the DNS guard: any network service left
-    /// pinned to the tunnel's own `DNS` servers (a broken state — that
-    /// resolver is unreachable without the tunnel) is reset to DHCP.
+    /// Bring a tunnel down and restore the host: tear the interface down (if
+    /// live), restore each network service's DNS from the journal snapshot
+    /// (falling back to clearing the tunnel's pinned resolver to DHCP), and
+    /// clear the journal.
     ///
-    /// The guard also runs when the tunnel was already down, so `vpn down` is
-    /// an explicit repair action for DNS poisoned by an unclean teardown
-    /// (crash, shutdown with the tunnel up).
+    /// Runs even when the tunnel is already down, so `vpn down` doubles as an
+    /// explicit repair for DNS poisoned by an unclean teardown (crash, or
+    /// shutdown with the tunnel up).
     pub fn down(&self, name: &str) -> Result<DownOutcome> {
+        self.reconcile()?;
         let tunnel = config::resolve(&self.config_dir, name)?;
         let dump = self.all_dump()?;
-        let changed = match self.find_live(&tunnel, &dump)? {
-            None => false,
-            Some(_) => {
-                let path = tunnel.path.to_string_lossy().into_owned();
-                let out = self.exec(&self.wg_quick, &["down", &path])?;
-                if !out.success() {
-                    return Err(backend_error(&self.wg_quick, &out));
-                }
-                true
-            }
-        };
-        let guard = self.dns_guard(&tunnel);
+        let live = self.find_live(&tunnel, &dump)?.is_some();
+        let (changed, guard) = self.teardown(&tunnel, live)?;
         Ok(DownOutcome {
             changed,
             dns_cleared: guard.cleared,
@@ -216,24 +258,334 @@ impl<R: CommandRunner> Backend<R> {
         })
     }
 
-    /// Run the DNS guard for a tunnel that was just brought (or found) down.
-    ///
-    /// Skipped when the config declares no `DNS`, or when any configured
-    /// tunnel is still up — in that case the system DNS is legitimately owned
-    /// by the live tunnel's `wg-quick` session. Never fails: guard problems
-    /// are embedded in the outcome.
-    fn dns_guard(&self, tunnel: &Tunnel) -> dns::GuardOutcome {
-        let Ok(summary) = config::conf_summary(&tunnel.path) else {
-            return dns::GuardOutcome::default();
+    /// Build an `Active` journal for `tunnel`, computing the lease deadline
+    /// from the injected clock.
+    fn active_journal(
+        &self,
+        tunnel: &Tunnel,
+        interface: Option<String>,
+        lease_secs: Option<u64>,
+        dns_snapshot: std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Journal {
+        let tunnel_dns = config::conf_summary(&tunnel.path)
+            .map(|s| s.dns_servers)
+            .unwrap_or_default();
+        Journal {
+            tunnel: tunnel.name.clone(),
+            phase: Phase::Active,
+            interface,
+            lease_deadline: lease_secs.map(|secs| self.clock.now().saturating_add(secs)),
+            dns_snapshot,
+            tunnel_dns,
+        }
+    }
+
+    /// Bring `tunnel` up with the journal as a write-ahead log: snapshot the
+    /// pre-tunnel DNS, record `UpPending`, run `wg-quick up`, then record
+    /// `Active` with the resolved interface. A crash at any point leaves a
+    /// journal that [`Backend::reconcile`] rolls back. Returns the post-up
+    /// status (one `wg` dump, as the old `up` did).
+    fn activate(&self, tunnel: &Tunnel, lease_secs: Option<u64>) -> Result<TunnelStatus> {
+        let dns_snapshot = self.journal_up_pending(tunnel)?;
+        let path = tunnel.path.to_string_lossy().into_owned();
+        let out = self.exec(&self.wg_quick, &["up", &path])?;
+        if !out.success() {
+            return Err(backend_error(&self.wg_quick, &out));
+        }
+        let dump = self.all_dump()?;
+        let live = self.find_live(tunnel, &dump)?;
+        let interface = live.map(|d| d.interface.clone());
+        state::write(
+            &self.config_dir,
+            &self.active_journal(tunnel, interface, lease_secs, dns_snapshot),
+        )?;
+        Ok(self.status_from(&tunnel.name, live, &dump))
+    }
+
+    /// Snapshot the pre-tunnel DNS (sanitized) and record an `UpPending`
+    /// journal, the write-ahead step before `wg-quick up`. Returns the
+    /// snapshot for the eventual `Active` record. No system calls when the
+    /// config declares no `DNS`.
+    fn journal_up_pending(
+        &self,
+        tunnel: &Tunnel,
+    ) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+        let tunnel_dns = config::conf_summary(&tunnel.path)
+            .map(|s| s.dns_servers)
+            .unwrap_or_default();
+        let dns_snapshot = if tunnel_dns.is_empty() {
+            Default::default()
+        } else {
+            dns::capture(&self.runner, &tunnel_dns).unwrap_or_default()
         };
-        if summary.dns_servers.is_empty() {
+        state::write(
+            &self.config_dir,
+            &Journal {
+                tunnel: tunnel.name.clone(),
+                phase: Phase::UpPending,
+                interface: None,
+                lease_deadline: None,
+                dns_snapshot: dns_snapshot.clone(),
+                tunnel_dns,
+            },
+        )?;
+        Ok(dns_snapshot)
+    }
+
+    /// Tear `tunnel` down and restore the host DNS. `live` says whether an
+    /// interface is currently up (the caller already knows: `down` checks,
+    /// `probe`/`exec` know they brought it up), so no extra `wg` dump is made.
+    /// Returns `(changed, dns)`. Idempotent: with nothing live it still
+    /// restores DNS and clears the journal — what makes `down` a repair.
+    fn teardown(&self, tunnel: &Tunnel, live: bool) -> Result<(bool, dns::GuardOutcome)> {
+        let journal = state::read(&self.config_dir, &tunnel.name);
+        if let Some(j) = &journal {
+            let mut pending = j.clone();
+            pending.phase = Phase::DownPending;
+            let _ = state::write(&self.config_dir, &pending);
+        }
+        let changed = if live {
+            let path = tunnel.path.to_string_lossy().into_owned();
+            let out = self.exec(&self.wg_quick, &["down", &path])?;
+            if !out.success() {
+                return Err(backend_error(&self.wg_quick, &out));
+            }
+            true
+        } else {
+            false
+        };
+        let guard = self.restore_dns(tunnel, journal.as_ref());
+        state::remove(&self.config_dir, &tunnel.name)?;
+        Ok((changed, guard))
+    }
+
+    /// Restore DNS after a teardown. Prefers the journal's sanitized snapshot
+    /// (which brings back custom static DNS, not just DHCP); falls back to
+    /// clearing the config's `DNS` servers wherever they are still pinned.
+    ///
+    /// Skipped when another configured tunnel is still up — that tunnel
+    /// legitimately owns the system DNS. Never fails.
+    fn restore_dns(&self, tunnel: &Tunnel, journal: Option<&Journal>) -> dns::GuardOutcome {
+        // Nothing DNS-related to do? Return before any system call, so tunnels
+        // without a `DNS` line cost nothing here.
+        let has_journal_dns = journal.is_some_and(|j| !j.tunnel_dns.is_empty());
+        let config_dns = if has_journal_dns {
+            Vec::new()
+        } else {
+            config::conf_summary(&tunnel.path)
+                .map(|s| s.dns_servers)
+                .unwrap_or_default()
+        };
+        if !has_journal_dns && config_dns.is_empty() {
             return dns::GuardOutcome::default();
         }
-        // Conservative on errors: if liveness is unknown, do not touch DNS.
-        if self.current().map_or(true, |active| !active.is_empty()) {
+        // A different live tunnel legitimately owns DNS; leave it alone.
+        // Conservative on error (unknown liveness → do not touch).
+        if self
+            .current()
+            .map_or(true, |active| active.iter().any(|n| n != &tunnel.name))
+        {
             return dns::GuardOutcome::default();
         }
-        dns::guard(&self.runner, &summary.dns_servers, &self.dns_sweeps)
+        if let Some(j) = journal {
+            if has_journal_dns {
+                // Prefer the snapshot: restores custom static DNS, not just DHCP.
+                return dns::restore(
+                    &self.runner,
+                    &j.dns_snapshot,
+                    &j.tunnel_dns,
+                    &self.dns_sweeps,
+                );
+            }
+        }
+        // No journal (e.g. poison predating this version): clear the config's
+        // pinned resolver to DHCP.
+        dns::guard(&self.runner, &config_dns, &self.dns_sweeps)
+    }
+
+    /// Roll back any partial or expired tunnel state recorded in the journals,
+    /// returning the host to a working configuration. Runs at the start of
+    /// every mutating command. Cheap when idle: with no journals it makes no
+    /// system calls at all, so ordinary operation is unaffected.
+    pub fn reconcile(&self) -> Result<Vec<Recovered>> {
+        let journals = state::read_all(&self.config_dir);
+        if journals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dump = self.all_dump()?;
+        let now = self.clock.now();
+        let mut recovered = Vec::new();
+        for journal in journals {
+            let live = self.journal_live(&journal, &dump);
+            let Reconciliation::Recover { tear_down, reason } =
+                state::reconcile_one(&journal, live, now)
+            else {
+                continue;
+            };
+            if tear_down {
+                self.tear_down_journal(&journal);
+            }
+            let guard = self.restore_dns_journal(&journal);
+            let _ = state::remove(&self.config_dir, &journal.tunnel);
+            recovered.push(Recovered {
+                tunnel: journal.tunnel.clone(),
+                reason: reason.describe().to_string(),
+                dns_cleared: guard.cleared,
+                dns_warning: guard.warning,
+            });
+        }
+        Ok(recovered)
+    }
+
+    /// Unconditional recovery — the "fix my machine" escape hatch. Needs no
+    /// tunnel name and tolerates missing configs: it reconciles every journal,
+    /// then tears down any remaining live WireGuard interface (orphans from a
+    /// crash or an older version) and clears any config's DNS still pinned
+    /// system-wide. Returns everything it changed.
+    pub fn recover(&self) -> Result<Vec<Recovered>> {
+        let mut recovered = self.reconcile()?;
+
+        // Tear down any WireGuard interface no journal accounts for. Every
+        // interface reported by `wg` is a WireGuard interface by definition.
+        let dump = self.all_dump()?;
+        let claimed: std::collections::BTreeSet<String> = state::read_all(&self.config_dir)
+            .into_iter()
+            .filter_map(|j| j.interface)
+            .collect();
+        let mut orphans: Vec<String> = dump
+            .iter()
+            .map(|d| d.interface.clone())
+            .filter(|iface| !claimed.contains(iface))
+            .collect();
+        orphans.sort();
+        orphans.dedup();
+        for iface in orphans {
+            // `wg-quick down` needs the config *path* on macOS (it rejects a
+            // bare interface name), so map the interface back to a config by
+            // peer identity. Without a matching config we cannot cleanly tear
+            // it down — report it with a manual hint rather than claim success.
+            match self.config_for_interface(&iface, &dump) {
+                Some(tunnel) => {
+                    let path = tunnel.path.to_string_lossy().into_owned();
+                    let torn = self
+                        .exec(&self.wg_quick, &["down", &path])
+                        .map(|o| o.success())
+                        .unwrap_or(false);
+                    recovered.push(Recovered {
+                        tunnel: tunnel.name,
+                        reason: if torn {
+                            "orphaned interface torn down".to_string()
+                        } else {
+                            format!("orphaned interface {iface} — teardown failed")
+                        },
+                        dns_cleared: Vec::new(),
+                        dns_warning: None,
+                    });
+                }
+                None => recovered.push(Recovered {
+                    tunnel: iface.clone(),
+                    reason: format!(
+                        "orphaned interface {iface} with no matching config — \
+                         remove it manually: wg-quick down <config> (or ifconfig {iface} destroy)"
+                    ),
+                    dns_cleared: Vec::new(),
+                    dns_warning: None,
+                }),
+            }
+        }
+
+        // Mop up any DNS still pinned to a known config's resolver, even for
+        // interfaces we never had a journal for.
+        let declared = self.declared_dns_servers();
+        if !declared.is_empty() && self.current().map(|a| a.is_empty()).unwrap_or(false) {
+            let guard = dns::guard(&self.runner, &declared, &self.dns_sweeps);
+            if !guard.cleared.is_empty() || guard.warning.is_some() {
+                recovered.push(Recovered {
+                    tunnel: "(dns)".to_string(),
+                    reason: "cleared residual VPN DNS".to_string(),
+                    dns_cleared: guard.cleared,
+                    dns_warning: guard.warning,
+                });
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Every distinct `DNS` server declared across all discovered configs.
+    fn declared_dns_servers(&self) -> Vec<String> {
+        let mut declared: Vec<String> = Vec::new();
+        for tunnel in config::discover(&self.config_dir).unwrap_or_default() {
+            if let Ok(summary) = config::conf_summary(&tunnel.path) {
+                for server in summary.dns_servers {
+                    if !declared.contains(&server) {
+                        declared.push(server);
+                    }
+                }
+            }
+        }
+        declared
+    }
+
+    /// The discovered tunnel whose peer identity is live on `iface`, if any.
+    /// Used by `recover` to map an orphan interface back to a config path
+    /// (which `wg-quick down` requires on macOS).
+    fn config_for_interface(&self, iface: &str, dump: &[DumpPeer]) -> Option<Tunnel> {
+        for tunnel in config::discover(&self.config_dir).ok()? {
+            if let Ok(Some(live)) = self.find_live(&tunnel, dump) {
+                if live.interface == iface {
+                    return Some(tunnel);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the journal's tunnel is currently live: by recorded interface
+    /// name if known, else by peer identity via its config (if it still
+    /// exists).
+    fn journal_live(&self, journal: &Journal, dump: &[DumpPeer]) -> bool {
+        if let Some(iface) = &journal.interface {
+            if dump.iter().any(|d| &d.interface == iface) {
+                return true;
+            }
+        }
+        config::resolve(&self.config_dir, &journal.tunnel)
+            .ok()
+            .and_then(|t| self.find_live(&t, dump).ok().flatten())
+            .is_some()
+    }
+
+    /// Tear down the interface a journal describes, preferring its config path
+    /// (so `wg-quick` restores routes correctly) and falling back to the bare
+    /// interface name when the config is gone. Best effort.
+    fn tear_down_journal(&self, journal: &Journal) {
+        let target = config::resolve(&self.config_dir, &journal.tunnel)
+            .ok()
+            .map(|t| t.path.to_string_lossy().into_owned())
+            .or_else(|| journal.interface.clone());
+        if let Some(target) = target {
+            let _ = self.exec(&self.wg_quick, &["down", &target]);
+        }
+    }
+
+    /// DNS restore driven purely by a journal (used during reconciliation,
+    /// where the config may be absent). Skips when another tunnel is still up.
+    fn restore_dns_journal(&self, journal: &Journal) -> dns::GuardOutcome {
+        if journal.tunnel_dns.is_empty() {
+            return dns::GuardOutcome::default();
+        }
+        if self
+            .current()
+            .is_ok_and(|active| active.iter().any(|n| n != &journal.tunnel))
+        {
+            return dns::GuardOutcome::default();
+        }
+        dns::restore(
+            &self.runner,
+            &journal.dns_snapshot,
+            &journal.tunnel_dns,
+            &self.dns_sweeps,
+        )
     }
 
     /// Probe latency through one tunnel, or through every configured tunnel
@@ -250,6 +602,7 @@ impl<R: CommandRunner> Backend<R> {
         max_time: u64,
         count: u32,
     ) -> Result<Vec<ProbeResult>> {
+        self.reconcile()?;
         let tunnels = match name {
             Some(n) => vec![config::resolve(&self.config_dir, n)?],
             None => config::discover(&self.config_dir)?,
@@ -325,11 +678,19 @@ impl<R: CommandRunner> Backend<R> {
         let path = tunnel.path.to_string_lossy().into_owned();
 
         if !was_up {
+            // Journal the activation (write-ahead) so a crash mid-probe
+            // self-heals on the next run. Journaling is best-effort — a disk
+            // hiccup must never fail a probe.
+            let snapshot = self.journal_up_pending(tunnel).unwrap_or_default();
             let out = self.exec(&self.wg_quick, &["up", &path])?;
             if !out.success() {
                 result.error = Some(backend_error(&self.wg_quick, &out).to_string());
                 return Ok(result);
             }
+            let _ = state::write(
+                &self.config_dir,
+                &self.active_journal(tunnel, None, None, snapshot),
+            );
         }
 
         // Interface details for the report (best effort — never fails a probe).
@@ -370,16 +731,8 @@ impl<R: CommandRunner> Backend<R> {
         }
 
         if !was_up {
-            match self.exec(&self.wg_quick, &["down", &path]) {
-                Ok(out) if out.success() => {
-                    result.warning = self.dns_guard(tunnel).note();
-                }
-                Ok(out) => {
-                    result.warning = Some(format!(
-                        "failed to restore tunnel state: {}",
-                        backend_error(&self.wg_quick, &out)
-                    ));
-                }
+            match self.teardown(tunnel, true) {
+                Ok((_, guard)) => result.warning = guard.note(),
                 Err(e) => {
                     result.warning = Some(format!("failed to restore tunnel state: {e}"));
                 }
@@ -564,6 +917,21 @@ pub struct DownOutcome {
     /// Network services whose stale VPN DNS the guard cleared (reset to DHCP).
     pub dns_cleared: Vec<String>,
     /// Non-fatal DNS-guard problem (stale DNS seen but not cleanly cleared).
+    pub dns_warning: Option<String>,
+}
+
+/// One tunnel (or interface) that reconciliation or recovery restored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Recovered {
+    /// Tunnel name, or interface name for an orphan with no journal.
+    pub tunnel: String,
+    /// Why it needed recovery (human-readable).
+    pub reason: String,
+    /// Network services whose DNS was restored/cleared.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_cleared: Vec<String>,
+    /// Non-fatal DNS problem during recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_warning: Option<String>,
 }
 
@@ -878,16 +1246,25 @@ impl<R: CommandRunner> Backend<R> {
     /// cannot be brought up is a hard error; a child that cannot be spawned is
     /// reported as [`Error::Spawn`] *after* the tunnel state is restored.
     pub fn exec_through(&self, name: &str, command: &[String]) -> Result<ExecOutcome> {
+        self.reconcile()?;
         let tunnel = config::resolve(&self.config_dir, name)?;
         let dump = self.all_dump()?;
         let was_up = self.find_live(&tunnel, &dump)?.is_some();
         let path = tunnel.path.to_string_lossy().into_owned();
 
         if !was_up {
+            // Journal the activation (write-ahead) so a crash while the child
+            // runs still self-heals on the next `vpn` command. No extra `wg`
+            // dump: exec does not need the interface name.
+            let snapshot = self.journal_up_pending(&tunnel)?;
             let out = self.exec(&self.wg_quick, &["up", &path])?;
             if !out.success() {
                 return Err(backend_error(&self.wg_quick, &out));
             }
+            let _ = state::write(
+                &self.config_dir,
+                &self.active_journal(&tunnel, None, None, snapshot),
+            );
         }
 
         let (program, args) = command.split_first().expect("clap requires a command");
@@ -895,16 +1272,8 @@ impl<R: CommandRunner> Backend<R> {
 
         let mut warning = None;
         if !was_up {
-            match self.exec(&self.wg_quick, &["down", &path]) {
-                Ok(out) if out.success() => {
-                    warning = self.dns_guard(&tunnel).note();
-                }
-                Ok(out) => {
-                    warning = Some(format!(
-                        "failed to restore tunnel state: {}",
-                        backend_error(&self.wg_quick, &out)
-                    ));
-                }
+            match self.teardown(&tunnel, true) {
+                Ok((_, guard)) => warning = guard.note(),
                 Err(e) => warning = Some(format!("failed to restore tunnel state: {e}")),
             }
         }
@@ -1713,16 +2082,18 @@ mod tests {
         let cfg = fixture();
         fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
         let runner = MockRunner::new();
-        runner.ok(""); // all_dump: down
+        runner.ok(""); // all_dump: down (detect)
+        runner.ok(SERVICES); // capture: list services
+        runner.ok(NO_DNS_SET); // capture: Wi-Fi is on DHCP pre-up
         runner.ok(""); // wg-quick up
         runner.ok(""); // child exits 0
         runner.ok(""); // wg-quick down
-        runner.ok(""); // guard: current() dump — nothing up
-        runner.ok(SERVICES);
-        runner.ok("10.2.0.1"); // poisoned
-        runner.ok(""); // reset
-        runner.ok(SERVICES);
-        runner.ok(NO_DNS_SET);
+        runner.ok(""); // restore_dns: current() dump — nothing up
+        runner.ok(""); // restore: set Wi-Fi to snapshot (Empty)
+        runner.ok(SERVICES); // guard net sweep 1: list
+        runner.ok(NO_DNS_SET); // guard net sweep 1: Wi-Fi clean
+        runner.ok(SERVICES); // guard net sweep 2: list
+        runner.ok(NO_DNS_SET); // guard net sweep 2: Wi-Fi clean
         let b = backend(runner, &cfg, false);
 
         let outcome = b.exec_through("home", &cmd(&["true"])).unwrap();
@@ -2395,5 +2766,241 @@ mod tests {
         let cfg = fixture();
         let b = backend(MockRunner::new(), &cfg, false);
         assert_eq!(b.config_dir(), cfg.path());
+    }
+
+    // ---- Journaled state, reconciliation, recovery, and leases ----
+
+    use std::collections::BTreeMap;
+
+    fn dns_journal(tunnel: &str, phase: Phase) -> Journal {
+        Journal {
+            tunnel: tunnel.to_string(),
+            phase,
+            interface: Some("utun7".to_string()),
+            lease_deadline: None,
+            dns_snapshot: BTreeMap::from([("Wi-Fi".to_string(), Vec::new())]),
+            tunnel_dns: vec!["10.2.0.1".to_string(), "2a07:b944::2:1".to_string()],
+        }
+    }
+
+    #[test]
+    fn up_records_active_journal_with_lease_deadline() {
+        let cfg = fixture(); // home.conf = CONF (no DNS)
+        let runner = MockRunner::new();
+        runner.ok(""); // all_dump: down (detect)
+        runner.ok(""); // wg-quick up
+        runner.ok(ALL_DUMP); // post-up dump: resolves utun7
+        let b = backend(runner, &cfg, false).with_fixed_time(1000);
+
+        let (changed, _status) = b.up_with_lease("home", Some(1800)).unwrap();
+        assert!(changed);
+        let journal = state::read(cfg.path(), "home").expect("journal written");
+        assert_eq!(journal.phase, Phase::Active);
+        assert_eq!(journal.interface.as_deref(), Some("utun7"));
+        assert_eq!(journal.lease_deadline, Some(2800));
+    }
+
+    #[test]
+    fn down_restores_custom_dns_from_journal_snapshot() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        // Journal says the real pre-tunnel DNS was a custom 9.9.9.9.
+        let mut j = dns_journal("home", Phase::Active);
+        j.dns_snapshot = BTreeMap::from([("Wi-Fi".to_string(), vec!["9.9.9.9".to_string()])]);
+        state::write(cfg.path(), &j).unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // reconcile: all_dump (journal healthy → untouched)
+        runner.ok(ALL_DUMP); // down: all_dump (find live)
+        runner.ok(""); // wg-quick down
+        runner.ok(""); // restore_dns: current() dump — nothing up
+        runner.ok(""); // restore: set Wi-Fi to 9.9.9.9
+        runner.ok(SERVICES); // guard net sweep 1: list
+        runner.ok("9.9.9.9"); // sweep 1: Wi-Fi (custom, not poison → clean)
+        runner.ok(SERVICES); // guard net sweep 2: list
+        runner.ok("9.9.9.9"); // sweep 2
+        let b = backend(runner.clone(), &cfg, false);
+
+        let outcome = b.down("home").unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.dns_cleared, vec!["Wi-Fi".to_string()]);
+        // The restore reapplied the CUSTOM DNS, not Empty.
+        let set = runner
+            .calls()
+            .into_iter()
+            .find(|(_, a)| a.first().map(String::as_str) == Some("-setdnsservers"))
+            .unwrap();
+        assert_eq!(set.1, vec!["-setdnsservers", "Wi-Fi", "9.9.9.9"]);
+        assert!(state::read(cfg.path(), "home").is_none(), "journal cleared");
+    }
+
+    #[test]
+    fn reconcile_is_a_noop_with_no_journals() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        let b = backend(runner.clone(), &cfg, false);
+        assert!(b.reconcile().unwrap().is_empty());
+        assert!(runner.calls().is_empty(), "idle reconcile makes no calls");
+    }
+
+    #[test]
+    fn reconcile_heals_crashed_up_pending_and_restores_dns() {
+        let cfg = fixture();
+        fs::write(cfg.path().join("home.conf"), CONF_DNS).unwrap();
+        // Crash during `up`: interface never came live.
+        let mut j = dns_journal("home", Phase::UpPending);
+        j.interface = None;
+        state::write(cfg.path(), &j).unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(""); // reconcile: all_dump — nothing live
+        runner.ok(""); // restore_dns: current() dump — nothing up
+        runner.ok(""); // restore: set Wi-Fi (snapshot Empty)
+        runner.ok(SERVICES); // guard sweep 1 list
+        runner.ok(NO_DNS_SET); // sweep 1 clean
+        runner.ok(SERVICES); // guard sweep 2 list
+        runner.ok(NO_DNS_SET); // sweep 2 clean
+        let b = backend(runner, &cfg, false);
+
+        let recovered = b.reconcile().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].reason.contains("bringing the tunnel up"));
+        assert_eq!(recovered[0].dns_cleared, vec!["Wi-Fi".to_string()]);
+        assert!(state::read(cfg.path(), "home").is_none());
+    }
+
+    #[test]
+    fn reconcile_tears_down_expired_lease() {
+        let cfg = fixture(); // CONF, no DNS
+        let mut j = Journal {
+            tunnel: "home".to_string(),
+            phase: Phase::Active,
+            interface: Some("utun7".to_string()),
+            lease_deadline: Some(500),
+            dns_snapshot: BTreeMap::new(),
+            tunnel_dns: Vec::new(),
+        };
+        j.lease_deadline = Some(500);
+        state::write(cfg.path(), &j).unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // reconcile: all_dump — utun7 live
+        runner.ok(""); // wg-quick down (lease expired)
+        let b = backend(runner.clone(), &cfg, false).with_fixed_time(1000);
+
+        let recovered = b.reconcile().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].reason.contains("lease expired"));
+        let downs: Vec<_> = runner
+            .calls()
+            .into_iter()
+            .filter(|(_, a)| a.first().map(String::as_str) == Some("down"))
+            .collect();
+        assert_eq!(downs.len(), 1, "expired tunnel torn down");
+        assert!(state::read(cfg.path(), "home").is_none());
+    }
+
+    #[test]
+    fn reconcile_leaves_healthy_active_tunnel_untouched() {
+        let cfg = fixture();
+        let j = Journal {
+            tunnel: "home".to_string(),
+            phase: Phase::Active,
+            interface: Some("utun7".to_string()),
+            lease_deadline: Some(9999),
+            dns_snapshot: BTreeMap::new(),
+            tunnel_dns: Vec::new(),
+        };
+        state::write(cfg.path(), &j).unwrap();
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // reconcile: all_dump — utun7 live, within lease
+        let b = backend(runner.clone(), &cfg, false).with_fixed_time(1000);
+
+        assert!(b.reconcile().unwrap().is_empty());
+        assert!(state::read(cfg.path(), "home").is_some(), "journal kept");
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|(_, a)| a.first().map(String::as_str) != Some("down")));
+    }
+
+    #[test]
+    fn recover_tears_down_orphan_via_config_path() {
+        let cfg = fixture(); // home.conf = CONF matches ALL_DUMP's utun7
+        let runner = MockRunner::new();
+        // recover -> reconcile (no journals, no calls) -> its own all_dump.
+        runner.ok(ALL_DUMP); // recover: all_dump — utun7 live, unclaimed
+        runner.ok(""); // wg-quick down <home.conf path>
+        let b = backend(runner.clone(), &cfg, false);
+
+        let recovered = b.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].tunnel, "home",
+            "mapped orphan iface to its config"
+        );
+        assert!(recovered[0].reason.contains("torn down"));
+        // Torn down by the config PATH (wg-quick rejects a bare interface on macOS).
+        let down = runner
+            .calls()
+            .into_iter()
+            .find(|(_, a)| a.first().map(String::as_str) == Some("down"))
+            .unwrap();
+        assert!(
+            down.1[1].ends_with("home.conf"),
+            "used config path: {:?}",
+            down.1
+        );
+    }
+
+    #[test]
+    fn recover_reports_orphan_with_no_matching_config() {
+        let cfg = tempdir().unwrap(); // no configs at all
+        let runner = MockRunner::new();
+        runner.ok(ALL_DUMP); // recover: all_dump — utun7 live, no config matches
+        let b = backend(runner.clone(), &cfg, false);
+
+        let recovered = b.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].tunnel, "utun7");
+        assert!(recovered[0].reason.contains("no matching config"));
+        // Nothing was torn down (we cannot safely).
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|(_, a)| a.first().map(String::as_str) != Some("down")));
+    }
+
+    #[test]
+    fn recover_is_clean_when_nothing_is_wrong() {
+        let cfg = fixture();
+        let runner = MockRunner::new();
+        runner.ok(""); // recover: all_dump — nothing live
+        let b = backend(runner, &cfg, false);
+        assert!(b.recover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn up_reconciles_a_crashed_tunnel_before_activating() {
+        let cfg = fixture(); // home.conf = CONF (no DNS)
+                             // A different tunnel crashed mid-up and left a stale journal.
+        let mut stale = dns_journal("ghost", Phase::UpPending);
+        stale.interface = None;
+        stale.tunnel_dns = Vec::new(); // no DNS work during its recovery
+        stale.dns_snapshot = BTreeMap::new();
+        state::write(cfg.path(), &stale).unwrap();
+
+        let runner = MockRunner::new();
+        runner.ok(""); // reconcile: all_dump — nothing live (ghost gone)
+        runner.ok(""); // up: all_dump (detect home down)
+        runner.ok(""); // wg-quick up home
+        runner.ok(ALL_DUMP); // post-up dump
+        let b = backend(runner, &cfg, false);
+
+        let (changed, _) = b.up("home").unwrap();
+        assert!(changed);
+        // The stale journal was reconciled away.
+        assert!(state::read(cfg.path(), "ghost").is_none());
+        assert!(state::read(cfg.path(), "home").is_some());
     }
 }

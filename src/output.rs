@@ -103,6 +103,11 @@ pub enum Report {
         /// One entry per environment check.
         checks: Vec<Check>,
     },
+    /// Result of `recover`.
+    Recover {
+        /// Tunnels/interfaces restored (empty when nothing needed fixing).
+        recovered: Vec<crate::backend::Recovered>,
+    },
 }
 
 impl Report {
@@ -263,6 +268,25 @@ fn human_report(report: &Report) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Report::Recover { recovered } => {
+            if recovered.is_empty() {
+                return "nothing to recover — host state is clean".to_string();
+            }
+            recovered
+                .iter()
+                .map(|r| {
+                    let mut line = format!("recovered {} ({})", r.tunnel, r.reason);
+                    if !r.dns_cleared.is_empty() {
+                        line.push_str(&format!("; restored DNS on {}", r.dns_cleared.join(", ")));
+                    }
+                    if let Some(w) = &r.dns_warning {
+                        line.push_str(&format!("; warning: {w}"));
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
 }
 
@@ -794,6 +818,29 @@ mod tests {
             }],
         };
         assert_eq!(healthy.exit_code(), 0);
+    }
+
+    #[test]
+    fn human_recover_clean_and_populated() {
+        let clean = Report::Recover { recovered: vec![] };
+        assert!(render_report(&clean, false).contains("nothing to recover"));
+
+        let populated = Report::Recover {
+            recovered: vec![crate::backend::Recovered {
+                tunnel: "proton".into(),
+                reason: "interrupted while bringing the tunnel up".into(),
+                dns_cleared: vec!["Wi-Fi".into()],
+                dns_warning: None,
+            }],
+        };
+        let text = render_report(&populated, false);
+        assert!(text.contains("recovered proton"));
+        assert!(text.contains("interrupted"));
+        assert!(text.contains("restored DNS on Wi-Fi"));
+        // JSON carries the structured list.
+        let v: Value = serde_json::from_str(&render_report(&populated, true)).unwrap();
+        assert_eq!(v["command"], "recover");
+        assert_eq!(v["recovered"][0]["tunnel"], "proton");
     }
 
     #[test]
